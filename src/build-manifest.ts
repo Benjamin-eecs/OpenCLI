@@ -30,6 +30,7 @@ interface ManifestEntry {
     type?: string;
     default?: any;
     required?: boolean;
+    positional?: boolean;
     help?: string;
     choices?: string[];
   }>;
@@ -140,6 +141,7 @@ function scanTs(filePath: string, site: string): ManifestEntry {
         const defaultMatch = body.match(/default\s*:\s*([^,}]+)/);
         const requiredMatch = body.match(/required\s*:\s*(true|false)/);
         const helpMatch = body.match(/help\s*:\s*['"`]([^'"`]*)['"`]/);
+        const positionalMatch = body.match(/positional\s*:\s*(true|false)/);
 
         let defaultVal: any = undefined;
         if (defaultMatch) {
@@ -156,6 +158,7 @@ function scanTs(filePath: string, site: string): ManifestEntry {
           type: typeMatch?.[1] ?? 'str',
           default: defaultVal,
           required: requiredMatch?.[1] === 'true',
+          positional: positionalMatch?.[1] === 'true' || undefined,
           help: helpMatch?.[1] ?? '',
         });
       }

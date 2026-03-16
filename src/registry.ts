@@ -17,6 +17,7 @@ export interface Arg {
   type?: string;
   default?: any;
   required?: boolean;
+  positional?: boolean;
   help?: string;
   choices?: string[];
 }

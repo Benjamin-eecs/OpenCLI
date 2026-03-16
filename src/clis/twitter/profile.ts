@@ -3,59 +3,127 @@ import { cli, Strategy } from '../../registry.js';
 cli({
   site: 'twitter',
   name: 'profile',
-  description: 'Fetch tweets from a user profile',
+  description: 'Fetch a Twitter user profile (bio, stats, etc.)',
   domain: 'x.com',
-  strategy: Strategy.INTERCEPT,
+  strategy: Strategy.COOKIE,
   browser: true,
   args: [
-    { name: 'username', type: 'string', required: true },
-    { name: 'limit', type: 'int', default: 15 },
+    { name: 'username', type: 'string', positional: true, help: 'Twitter screen name (without @). Defaults to logged-in user.' },
   ],
-  columns: ['id', 'text', 'likes', 'views', 'url'],
+  columns: ['screen_name', 'name', 'bio', 'location', 'url', 'followers', 'following', 'tweets', 'likes', 'verified', 'created_at'],
   func: async (page, kwargs) => {
-    // Navigate to user profile via search for reliability
-    await page.goto(`https://x.com/search?q=from:${kwargs.username}&f=live`);
-    await page.wait(5);
+    let username = (kwargs.username || '').replace(/^@/, '');
 
-    // Inject XHR interceptor
-    await page.installInterceptor('SearchTimeline');
-
-    // Trigger API by scrolling
-    await page.autoScroll({ times: 3, delayMs: 2000 });
-    
-    // Retrieve data
-    const requests = await page.getInterceptedRequests();
-    if (!requests || requests.length === 0) return [];
-
-    let results: any[] = [];
-    for (const req of requests) {
-      try {
-        const insts = req.data.data.search_by_raw_query.search_timeline.timeline.instructions;
-        const addEntries = insts.find((i: any) => i.type === 'TimelineAddEntries');
-        if (!addEntries) continue;
-
-        for (const entry of addEntries.entries) {
-          if (!entry.entryId.startsWith('tweet-')) continue;
-          
-          let tweet = entry.content?.itemContent?.tweet_results?.result;
-          if (!tweet) continue;
-
-          if (tweet.__typename === 'TweetWithVisibilityResults' && tweet.tweet) {
-              tweet = tweet.tweet;
-          }
-
-          results.push({
-            id: tweet.rest_id,
-            text: tweet.legacy?.full_text || '',
-            likes: tweet.legacy?.favorite_count || 0,
-            views: tweet.views?.count || '0',
-            url: `https://x.com/i/status/${tweet.rest_id}`
-          });
-        }
-      } catch (e) {
-      }
+    // If no username, detect the logged-in user
+    if (!username) {
+      await page.goto('https://x.com/home');
+      await page.wait(5);
+      const href = await page.evaluate(`() => {
+        const link = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
+        return link ? link.getAttribute('href') : null;
+      }`);
+      if (!href) throw new Error('Could not detect logged-in user. Are you logged in?');
+      username = href.replace('/', '');
     }
 
-    return results.slice(0, kwargs.limit);
+    // Navigate directly to the user's profile page (gives us cookie context)
+    await page.goto(`https://x.com/${username}`);
+    await page.wait(3);
+
+    const result = await page.evaluate(`
+      async () => {
+        const screenName = "${username}";
+        const ct0 = document.cookie.split(';').map(c=>c.trim()).find(c=>c.startsWith('ct0='))?.split('=')[1];
+        if (!ct0) return {error: 'No ct0 cookie — not logged into x.com'};
+
+        const bearer = 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
+        const headers = {
+          'Authorization': 'Bearer ' + decodeURIComponent(bearer),
+          'X-Csrf-Token': ct0,
+          'X-Twitter-Auth-Type': 'OAuth2Session',
+          'X-Twitter-Active-User': 'yes'
+        };
+
+        const variables = JSON.stringify({
+          screen_name: screenName,
+          withSafetyModeUserFields: true,
+        });
+        const features = JSON.stringify({
+          hidden_profile_subscriptions_enabled: true,
+          rweb_tipjar_consumption_enabled: true,
+          responsive_web_graphql_exclude_directive_enabled: true,
+          verified_phone_label_enabled: false,
+          subscriptions_verification_info_is_identity_verified_enabled: true,
+          subscriptions_verification_info_verified_since_enabled: true,
+          highlights_tweets_tab_ui_enabled: true,
+          responsive_web_twitter_article_notes_tab_enabled: true,
+          subscriptions_feature_can_gift_premium: true,
+          creator_subscriptions_tweet_preview_api_enabled: true,
+          responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
+          responsive_web_graphql_timeline_navigation_enabled: true,
+        });
+
+        // Dynamically resolve queryId: GitHub community source → JS bundle scan → hardcoded fallback
+        async function resolveQueryId(operationName, fallbackId) {
+          try {
+            const ghResp = await fetch('https://raw.githubusercontent.com/fa0311/twitter-openapi/refs/heads/main/src/config/placeholder.json');
+            if (ghResp.ok) {
+              const data = await ghResp.json();
+              const entry = data[operationName];
+              if (entry && entry.queryId) return entry.queryId;
+            }
+          } catch {}
+          try {
+            const scripts = performance.getEntriesByType('resource')
+              .filter(r => r.name.includes('client-web') && r.name.endsWith('.js'))
+              .map(r => r.name);
+            for (const scriptUrl of scripts.slice(0, 15)) {
+              try {
+                const text = await (await fetch(scriptUrl)).text();
+                const re = new RegExp('queryId:"([A-Za-z0-9_-]+)"[^}]{0,200}operationName:"' + operationName + '"');
+                const m = text.match(re);
+                if (m) return m[1];
+              } catch {}
+            }
+          } catch {}
+          return fallbackId;
+        }
+
+        const queryId = await resolveQueryId('UserByScreenName', 'qRednkZG-rn1P6b48NINmQ');
+        const url = '/i/api/graphql/' + queryId + '/UserByScreenName?variables='
+          + encodeURIComponent(variables)
+          + '&features=' + encodeURIComponent(features);
+
+        const resp = await fetch(url, {headers, credentials: 'include'});
+        if (!resp.ok) return {error: 'HTTP ' + resp.status, hint: 'User may not exist or queryId expired'};
+        const d = await resp.json();
+
+        const result = d.data?.user?.result;
+        if (!result) return {error: 'User @' + screenName + ' not found'};
+
+        const legacy = result.legacy || {};
+        const expandedUrl = legacy.entities?.url?.urls?.[0]?.expanded_url || '';
+
+        return [{
+          screen_name: legacy.screen_name || screenName,
+          name: legacy.name || '',
+          bio: legacy.description || '',
+          location: legacy.location || '',
+          url: expandedUrl,
+          followers: legacy.followers_count || 0,
+          following: legacy.friends_count || 0,
+          tweets: legacy.statuses_count || 0,
+          likes: legacy.favourites_count || 0,
+          verified: result.is_blue_verified || legacy.verified || false,
+          created_at: legacy.created_at || '',
+        }];
+      }
+    `);
+
+    if (result?.error) {
+      throw new Error(result.error + (result.hint ? ` (${result.hint})` : ''));
+    }
+
+    return result || [];
   }
 });

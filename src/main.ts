@@ -129,18 +129,37 @@ for (const [, cmd] of registry) {
   if (!siteCmd) { siteCmd = program.command(cmd.site).description(`${cmd.site} commands`); siteGroups.set(cmd.site, siteCmd); }
   const subCmd = siteCmd.command(cmd.name).description(cmd.description);
 
+  // Register positional args first, then named options
+  const positionalArgs: typeof cmd.args = [];
   for (const arg of cmd.args) {
-    const flag = arg.required ? `--${arg.name} <value>` : `--${arg.name} [value]`;
-    if (arg.required) subCmd.requiredOption(flag, arg.help ?? '');
-    else if (arg.default != null) subCmd.option(flag, arg.help ?? '', String(arg.default));
-    else subCmd.option(flag, arg.help ?? '');
+    if (arg.positional) {
+      const bracket = arg.required ? `<${arg.name}>` : `[${arg.name}]`;
+      subCmd.argument(bracket, arg.help ?? '');
+      positionalArgs.push(arg);
+    } else {
+      const flag = arg.required ? `--${arg.name} <value>` : `--${arg.name} [value]`;
+      if (arg.required) subCmd.requiredOption(flag, arg.help ?? '');
+      else if (arg.default != null) subCmd.option(flag, arg.help ?? '', String(arg.default));
+      else subCmd.option(flag, arg.help ?? '');
+    }
   }
   subCmd.option('-f, --format <fmt>', 'Output format: table, json, yaml, md, csv', 'table').option('-v, --verbose', 'Debug output', false);
 
-  subCmd.action(async (actionOpts) => {
+  subCmd.action(async (...actionArgs: any[]) => {
+    // Commander passes positional args first, then options object, then the Command
+    const actionOpts = actionArgs[positionalArgs.length] ?? {};
     const startTime = Date.now();
     const kwargs: Record<string, any> = {};
+    // Collect positional args
+    for (let i = 0; i < positionalArgs.length; i++) {
+      const arg = positionalArgs[i];
+      const v = actionArgs[i];
+      if (v !== undefined) kwargs[arg.name] = coerce(v, arg.type ?? 'str');
+      else if (arg.default != null) kwargs[arg.name] = arg.default;
+    }
+    // Collect named options
     for (const arg of cmd.args) {
+      if (arg.positional) continue;
       const v = actionOpts[arg.name]; if (v !== undefined) kwargs[arg.name] = coerce(v, arg.type ?? 'str');
       else if (arg.default != null) kwargs[arg.name] = arg.default;
     }
