@@ -15,7 +15,6 @@ import { findPackageRoot, getBuiltEntryCandidates } from './package-paths.js';
 import { type CliCommand, fullName, getRegistry, strategyLabel } from './registry.js';
 import { serializeCommand, formatArgSummary } from './serialization.js';
 import { render as renderOutput } from './output.js';
-import { getBrowserFactory, browserSession } from './runtime.js';
 import { PKG_VERSION } from './version.js';
 import { printCompletionScript } from './completion.js';
 import { loadExternalClis, executeExternalCli, installExternalCli, registerExternalCli, isBinaryInstalled } from './external.js';
@@ -23,6 +22,11 @@ import { registerAllCommands } from './commanderAdapter.js';
 import { EXIT_CODES, getErrorMessage, BrowserConnectError } from './errors.js';
 import { TargetError } from './browser/target-errors.js';
 import { resolveTargetJs, getTextResolvedJs, getValueResolvedJs, getAttributesResolvedJs, selectResolvedJs, isAutocompleteResolvedJs } from './browser/target-resolver.js';
+import { inferShape } from './browser/shape.js';
+import { assignKeys } from './browser/network-key.js';
+import { DEFAULT_TTL_MS, findEntry, loadNetworkCache, saveNetworkCache, type CachedNetworkEntry } from './browser/network-cache.js';
+import { parseFilter, shapeMatchesFilter } from './browser/shape-filter.js';
+import { buildHtmlTreeJs, type HtmlTreeResult } from './browser/html-tree.js';
 import { daemonStatus, daemonStop } from './commands/daemon.js';
 import { log } from './logger.js';
 
@@ -38,6 +42,49 @@ type BrowserNetworkItem = {
   ct: string;
   body: unknown;
 };
+
+/**
+ * Normalize raw capture entries (from daemon/CDP `readNetworkCapture` or
+ * the JS interceptor's `window.__opencli_net`) into a consistent shape.
+ * Response preview is parsed as JSON when possible, otherwise kept as string.
+ */
+async function captureNetworkItems(page: import('./types.js').IPage): Promise<BrowserNetworkItem[]> {
+  if (page.readNetworkCapture) {
+    const raw = await page.readNetworkCapture();
+    return (raw as Array<Record<string, unknown>>).map((e) => {
+      const preview = (e.responsePreview as string) ?? null;
+      let body: unknown = null;
+      if (preview) {
+        try { body = JSON.parse(preview); } catch { body = preview; }
+      }
+      return {
+        url: (e.url as string) || '',
+        method: (e.method as string) || 'GET',
+        status: (e.responseStatus as number) || 0,
+        size: preview ? preview.length : 0,
+        ct: (e.responseContentType as string) || '',
+        body,
+      };
+    });
+  }
+  const raw = await page.evaluate(`(function(){ return JSON.stringify(window.__opencli_net || []); })()`) as string;
+  try { return JSON.parse(raw) as BrowserNetworkItem[]; } catch { return []; }
+}
+
+/** Drop static-resource / telemetry noise so agents see only API-shaped traffic. */
+function filterNetworkItems(items: BrowserNetworkItem[]): BrowserNetworkItem[] {
+  return items.filter((r) =>
+    (r.ct?.includes('json') || r.ct?.includes('xml') || r.ct?.includes('text/plain')) &&
+    !/\.(js|css|png|jpg|gif|svg|woff|ico|map)(\?|$)/i.test(r.url) &&
+    !/analytics|tracking|telemetry|beacon|pixel|gtag|fbevents/i.test(r.url),
+  );
+}
+
+/** Emit a structured error JSON so agents can branch on `error.code` without regex. */
+function emitNetworkError(code: string, message: string, extra: Record<string, unknown> = {}): void {
+  console.log(JSON.stringify({ error: { code, message, ...extra } }, null, 2));
+  process.exitCode = EXIT_CODES.USAGE_ERROR;
+}
 
 type BrowserTargetState = {
   defaultPage?: string;
@@ -292,145 +339,6 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
       process.exitCode = r.ok ? EXIT_CODES.SUCCESS : EXIT_CODES.GENERIC_ERROR;
     });
 
-  // ── Built-in: explore / synthesize / generate / cascade ───────────────────
-
-  program
-    .command('explore')
-    .alias('probe')
-    .description('Explore a website: discover APIs, stores, and recommend strategies')
-    .argument('<url>')
-    .option('--site <name>')
-    .option('--goal <text>')
-    .option('--wait <s>', '', '3')
-    .option('--auto', 'Enable interactive fuzzing')
-    .option('--click <labels>', 'Comma-separated labels to click before fuzzing')
-    .option('-v, --verbose', 'Debug output')
-    .action(async (url: string, opts: {
-      site?: string;
-      goal?: string;
-      wait: string;
-      auto?: boolean;
-      click?: string;
-      verbose?: boolean;
-    }) => {
-      applyVerbose(opts);
-      const { exploreUrl, renderExploreSummary } = await import('./explore.js');
-      const clickLabels = opts.click
-        ? opts.click.split(',').map((s: string) => s.trim())
-        : undefined;
-      const workspace = `explore:${inferHost(url, opts.site)}`;
-      const result = await exploreUrl(url, {
-        BrowserFactory: getBrowserFactory(),
-        site: opts.site,
-        goal: opts.goal,
-        waitSeconds: parseFloat(opts.wait),
-        auto: opts.auto,
-        clickLabels,
-        workspace,
-      });
-      console.log(renderExploreSummary(result));
-    });
-
-  program
-    .command('synthesize')
-    .description('Synthesize CLIs from explore')
-    .argument('<target>')
-    .option('--top <n>', '', '3')
-    .option('-v, --verbose', 'Debug output')
-    .action(async (target, opts) => {
-      applyVerbose(opts);
-      const { synthesizeFromExplore, renderSynthesizeSummary } = await import('./synthesize.js');
-      console.log(renderSynthesizeSummary(synthesizeFromExplore(target, { top: parseInt(opts.top) })));
-    });
-
-  program
-    .command('generate')
-    .description('One-shot: explore → synthesize → verify → register')
-    .argument('<url>')
-    .option('--goal <text>')
-    .option('--site <name>')
-    .option('--format <fmt>', 'Output format: table, json', 'table')
-    .option('--no-register', 'Verify the generated adapter without registering it')
-    .option('-v, --verbose', 'Debug output')
-    .action(async (url: string, opts: {
-      goal?: string;
-      site?: string;
-      format?: string;
-      register?: boolean;
-      verbose?: boolean;
-    }) => {
-      applyVerbose(opts);
-      const { generateVerifiedFromUrl, renderGenerateVerifiedSummary } = await import('./generate-verified.js');
-      const workspace = `generate:${inferHost(url, opts.site)}`;
-      const r = await generateVerifiedFromUrl({
-        url,
-        BrowserFactory: getBrowserFactory(),
-        goal: opts.goal,
-        site: opts.site,
-        workspace,
-        noRegister: opts.register === false,
-      });
-      if (opts.format === 'json') console.log(JSON.stringify(r, null, 2));
-      else console.log(renderGenerateVerifiedSummary(r));
-      process.exitCode = r.status === 'success' ? EXIT_CODES.SUCCESS : EXIT_CODES.GENERIC_ERROR;
-    });
-
-  // ── Built-in: record ─────────────────────────────────────────────────────
-
-  program
-    .command('record')
-    .description('Record API calls from a live browser session → generate YAML candidates')
-    .argument('<url>', 'URL to open and record')
-    .option('--site <name>', 'Site name (inferred from URL if omitted)')
-    .option('--out <dir>', 'Output directory for candidates')
-    .option('--poll <ms>', 'Poll interval in milliseconds', '2000')
-    .option('--timeout <ms>', 'Auto-stop after N milliseconds (default: 60000)', '60000')
-    .option('-v, --verbose', 'Debug output')
-    .action(async (url: string, opts: {
-      site?: string;
-      out?: string;
-      poll: string;
-      timeout: string;
-      verbose?: boolean;
-    }) => {
-      applyVerbose(opts);
-      const { recordSession, renderRecordSummary } = await import('./record.js');
-      const result = await recordSession({
-        BrowserFactory: getBrowserFactory(),
-        url,
-        site: opts.site,
-        outDir: opts.out,
-        pollMs: parseInt(opts.poll, 10),
-        timeoutMs: parseInt(opts.timeout, 10),
-      });
-      console.log(renderRecordSummary(result));
-      process.exitCode = result.candidateCount > 0 ? EXIT_CODES.SUCCESS : EXIT_CODES.EMPTY_RESULT;
-    });
-
-  program
-    .command('cascade')
-    .description('Strategy cascade: find simplest working strategy')
-    .argument('<url>')
-    .option('--site <name>')
-    .option('-v, --verbose', 'Debug output')
-    .action(async (url: string, opts: {
-      site?: string;
-      verbose?: boolean;
-    }) => {
-      applyVerbose(opts);
-      const { cascadeProbe, renderCascadeResult } = await import('./cascade.js');
-      const workspace = `cascade:${inferHost(url, opts.site)}`;
-      const result = await browserSession(getBrowserFactory(), async (page) => {
-        try {
-          const siteUrl = new URL(url);
-          await page.goto(`${siteUrl.protocol}//${siteUrl.host}`);
-          await page.wait(2);
-        } catch {}
-        return cascadeProbe(page, url);
-      }, { workspace });
-      console.log(renderCascadeResult(result));
-    });
-
   // ── Built-in: browser (browser control for Claude Code skill) ───────────────
   //
   // Make websites accessible for AI agents.
@@ -640,11 +548,102 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
       console.log(val ?? '(empty)');
     }));
 
-  addBrowserTabOption(get.command('html').option('--selector <css>', 'CSS selector scope').description('Page HTML (or scoped)'))
+  addBrowserTabOption(
+    get.command('html')
+      .option('--selector <css>', 'CSS selector scope (first match)')
+      .option('--as <format>', 'Output format: "html" (default) or "json" for structured tree', 'html')
+      .option('--max <n>', 'Max characters of raw HTML to return (0 = unlimited)', '0')
+      .description('Page HTML (or scoped); use --as json for a {tag, attrs, text, children} tree'),
+  )
     .action(browserAction(async (page, opts) => {
+      const format = String(opts.as || 'html').toLowerCase();
+      if (format !== 'html' && format !== 'json') {
+        console.log(JSON.stringify({ error: { code: 'invalid_format', message: `--as must be "html" or "json", got "${opts.as}"` } }, null, 2));
+        process.exitCode = EXIT_CODES.USAGE_ERROR;
+        return;
+      }
+
+      // `--max` is validated up-front (before touching the page) so a bad value
+      // gets the same structured error regardless of selector/format path.
+      const rawMax = String(opts.max ?? '0');
+      if (!/^\d+$/.test(rawMax)) {
+        console.log(JSON.stringify({ error: { code: 'invalid_max', message: `--max must be a non-negative integer, got "${opts.max}"` } }, null, 2));
+        process.exitCode = EXIT_CODES.USAGE_ERROR;
+        return;
+      }
+      const max = Number.parseInt(rawMax, 10);
+
+      if (format === 'json') {
+        const js = buildHtmlTreeJs({ selector: opts.selector ?? null });
+        const result = await page.evaluate(js) as HtmlTreeResult | { selector: string; invalidSelector: true; reason: string } | null;
+        if (result && typeof result === 'object' && 'invalidSelector' in result && result.invalidSelector) {
+          console.log(JSON.stringify({
+            error: { code: 'invalid_selector', message: `Selector "${opts.selector}" is not a valid CSS selector: ${result.reason}` },
+          }, null, 2));
+          process.exitCode = EXIT_CODES.USAGE_ERROR;
+          return;
+        }
+        const ok = result as HtmlTreeResult | null;
+        if (!ok || ok.matched === 0) {
+          console.log(JSON.stringify({
+            error: {
+              code: 'selector_not_found',
+              message: opts.selector
+                ? `Selector "${opts.selector}" matched 0 elements.`
+                : 'Page has no documentElement.',
+            },
+          }, null, 2));
+          process.exitCode = EXIT_CODES.USAGE_ERROR;
+          return;
+        }
+        console.log(JSON.stringify(ok, null, 2));
+        return;
+      }
+
+      // Raw HTML path — unbounded by default; --max optionally caps with a visible marker.
+      // Selector lookup is wrapped in try/catch inside page context so an invalid
+      // selector returns a structured signal instead of throwing through page.evaluate.
       const sel = opts.selector ? JSON.stringify(opts.selector) : 'null';
-      const html = await page.evaluate(`(${sel} ? document.querySelector(${sel})?.outerHTML : document.documentElement.outerHTML)?.slice(0, 50000)`);
-      console.log(html ?? '(empty)');
+      const rawResult = await page.evaluate(
+        `(() => {
+          const s = ${sel};
+          if (s) {
+            try {
+              const el = document.querySelector(s);
+              return { kind: 'ok', html: el ? el.outerHTML : null };
+            } catch (e) {
+              return { kind: 'invalid_selector', reason: (e && e.message) || String(e) };
+            }
+          }
+          return { kind: 'ok', html: document.documentElement ? document.documentElement.outerHTML : null };
+        })()`,
+      ) as { kind: 'ok'; html: string | null } | { kind: 'invalid_selector'; reason: string };
+
+      if (rawResult.kind === 'invalid_selector') {
+        console.log(JSON.stringify({
+          error: { code: 'invalid_selector', message: `Selector "${opts.selector}" is not a valid CSS selector: ${rawResult.reason}` },
+        }, null, 2));
+        process.exitCode = EXIT_CODES.USAGE_ERROR;
+        return;
+      }
+      const html = rawResult.html;
+
+      if (html === null) {
+        if (opts.selector) {
+          console.log(JSON.stringify({
+            error: { code: 'selector_not_found', message: `Selector "${opts.selector}" matched 0 elements.` },
+          }, null, 2));
+          process.exitCode = EXIT_CODES.USAGE_ERROR;
+          return;
+        }
+        console.log('(empty)');
+        return;
+      }
+      if (max > 0 && html.length > max) {
+        console.log(`<!-- opencli: truncated ${max} of ${html.length} chars; re-run without --max (or --max 0) for full -->\n${html.slice(0, max)}`);
+        return;
+      }
+      console.log(html);
     }));
 
   addBrowserTabOption(get.command('attributes').argument('<index>', 'Element index').description('Element attributes'))
@@ -755,70 +754,148 @@ export function createProgram(BUILTIN_CLIS: string, USER_CLIS: string): Command 
     }));
 
   // ── Network (API discovery) ──
+  //
+  // Default output is JSON (agent-native). Each entry carries a stable `key`
+  // (GraphQL operationName or `METHOD host+pathname`) so agents can fetch
+  // full bodies with `--detail <key>` even after subsequent commands.
+  // Captures are persisted per workspace under ~/.opencli/cache/browser-network/.
 
   addBrowserTabOption(browser.command('network'))
-    .option('--detail <index>', 'Show full response body of request at index')
-    .option('--all', 'Show all requests including static resources')
-    .description('Show captured network requests (auto-captured since last open)')
+    .option('--detail <key>', 'Emit full body for the entry with this key')
+    .option('--all', 'Include static resources (js/css/images/telemetry)')
+    .option('--raw', 'Emit full bodies for every entry (skip shape preview)')
+    .option('--filter <fields>', 'Comma-separated field names; keep only entries whose body shape has ALL names as path segments')
+    .option('--ttl <ms>', 'Cache TTL in ms for --detail lookups', String(DEFAULT_TTL_MS))
+    .description('Capture network requests as shape previews; retrieve full bodies by key')
     .action(browserAction(async (page, opts) => {
-      let items: BrowserNetworkItem[] = [];
-      if (page.readNetworkCapture) {
-        const raw = await page.readNetworkCapture();
-        // Normalize daemon/CDP capture entries to __opencli_net shape.
-        // Daemon returns: responseStatus, responseContentType, responsePreview
-        // CDP returns the same shape after PR A fix.
-        items = (raw as Array<Record<string, unknown>>).map(e => {
-          const preview = (e.responsePreview as string) ?? null;
-          let body: unknown = null;
-          if (preview) {
-            try { body = JSON.parse(preview); } catch { body = preview; }
-          }
-          return {
-            url: (e.url as string) || '',
-            method: (e.method as string) || 'GET',
-            status: (e.responseStatus as number) || 0,
-            size: preview ? preview.length : 0,
-            ct: (e.responseContentType as string) || '',
-            body,
-          };
-        });
+      const ttlMs = parsePositiveIntOption(opts.ttl, 'ttl', DEFAULT_TTL_MS);
+      const workspace = DEFAULT_BROWSER_WORKSPACE;
+      const hasDetail = typeof opts.detail === 'string' && opts.detail.length > 0;
+      const hasFilter = typeof opts.filter === 'string';
+
+      // --detail and --filter do different things (one request by key vs. narrow
+      // the list by shape), don't compose, and combining them has no sensible
+      // semantic. Reject up front with a structured error instead of silently
+      // dropping one.
+      if (hasDetail && hasFilter) {
+        emitNetworkError('invalid_args', '--filter and --detail cannot be used together (one narrows a list, the other fetches a specific entry).');
+        return;
+      }
+
+      let filterFields: string[] | null = null;
+      if (hasFilter) {
+        const parsed = parseFilter(opts.filter as string);
+        if ('reason' in parsed) {
+          emitNetworkError('invalid_filter', parsed.reason);
+          return;
+        }
+        filterFields = parsed.fields;
+      }
+
+      // --detail short-circuits: read from cache only, no live capture needed.
+      if (hasDetail) {
+        const res = loadNetworkCache(workspace, { ttlMs });
+        if (res.status === 'missing') {
+          emitNetworkError('cache_missing', `No cached capture. Run "browser network" first (in workspace "${workspace}").`);
+          return;
+        }
+        if (res.status === 'expired') {
+          emitNetworkError('cache_expired', `Cache is stale (age ${res.ageMs}ms > ttl ${ttlMs}ms). Re-run "browser network" to refresh.`);
+          return;
+        }
+        if (res.status === 'corrupt' || !res.file) {
+          emitNetworkError('cache_corrupt', 'Cache file is malformed; re-run "browser network" to regenerate.');
+          return;
+        }
+        const entry = findEntry(res.file, opts.detail);
+        if (!entry) {
+          emitNetworkError('key_not_found', `Key "${opts.detail}" not in cache.`, {
+            available_keys: res.file.entries.map((e) => e.key),
+          });
+          return;
+        }
+        console.log(JSON.stringify({
+          key: entry.key,
+          url: entry.url,
+          method: entry.method,
+          status: entry.status,
+          ct: entry.ct,
+          size: entry.size,
+          shape: inferShape(entry.body),
+          body: entry.body,
+        }, null, 2));
+        return;
+      }
+
+      // Fresh capture path.
+      let rawItems: BrowserNetworkItem[];
+      try {
+        rawItems = await captureNetworkItems(page);
+      } catch (err) {
+        emitNetworkError('capture_failed', `Could not read network capture: ${(err as Error).message}`);
+        return;
+      }
+
+      const items = opts.all ? rawItems : filterNetworkItems(rawItems);
+      const filteredOut = rawItems.length - items.length;
+
+      const keyed = assignKeys(items);
+      const cacheEntries: CachedNetworkEntry[] = keyed.map((it) => ({
+        key: it.key,
+        url: it.url,
+        method: it.method,
+        status: it.status,
+        size: it.size,
+        ct: it.ct,
+        body: it.body,
+      }));
+      // Soft failure: the caller already has the data, so surface a warning
+      // via the output envelope rather than erroring out the whole command.
+      let cacheWarning: string | null = null;
+      try {
+        saveNetworkCache(workspace, cacheEntries);
+      } catch (err) {
+        cacheWarning = `Could not persist capture cache: ${(err as Error).message}. --detail lookups may miss this capture.`;
+      }
+
+      // Pair each cache entry with its shape up front so --filter can read
+      // segments without recomputing, and the --raw view can keep the full
+      // body. Cache persistence above stored the unfiltered set on purpose:
+      // later `--detail <key>` lookups must still see requests that the
+      // current --filter narrowed out.
+      const shaped = cacheEntries.map((e) => ({ entry: e, shape: inferShape(e.body) }));
+      const visible = filterFields
+        ? shaped.filter((s) => shapeMatchesFilter(s.shape, filterFields))
+        : shaped;
+      const filterDropped = filterFields ? shaped.length - visible.length : 0;
+
+      const envelope: Record<string, unknown> = {
+        workspace,
+        captured_at: new Date().toISOString(),
+        count: visible.length,
+        filtered_out: filteredOut,
+      };
+      if (filterFields) {
+        envelope.filter = filterFields;
+        envelope.filter_dropped = filterDropped;
+      }
+      if (cacheWarning) envelope.cache_warning = cacheWarning;
+
+      if (opts.raw) {
+        envelope.entries = visible.map((s) => s.entry);
       } else {
-        // Fallback to JS interceptor data
-        const requests = await page.evaluate(`(function(){
-          var reqs = window.__opencli_net || [];
-          return JSON.stringify(reqs);
-        })()`) as string;
-        try { items = JSON.parse(requests); } catch { console.log('No network data captured. Run "browser open <url>" first.'); return; }
+        envelope.entries = visible.map((s) => ({
+          key: s.entry.key,
+          method: s.entry.method,
+          status: s.entry.status,
+          url: s.entry.url,
+          ct: s.entry.ct,
+          size: s.entry.size,
+          shape: s.shape,
+        }));
+        envelope.detail_hint = 'Run "browser network --detail <key>" for full body.';
       }
-
-      if (items.length === 0) { console.log('No requests captured.'); return; }
-
-      // Filter out static resources unless --all
-      if (!opts.all) {
-        items = items.filter(r =>
-          (r.ct?.includes('json') || r.ct?.includes('xml') || r.ct?.includes('text/plain')) &&
-          !/\.(js|css|png|jpg|gif|svg|woff|ico|map)(\?|$)/i.test(r.url) &&
-          !/analytics|tracking|telemetry|beacon|pixel|gtag|fbevents/i.test(r.url)
-        );
-      }
-
-      if (opts.detail !== undefined) {
-        const idx = parseInt(opts.detail, 10);
-        const req = items[idx];
-        if (!req) { console.error(`Request #${idx} not found. ${items.length} requests available.`); process.exitCode = EXIT_CODES.USAGE_ERROR; return; }
-        console.log(`${req.method} ${req.url}`);
-        console.log(`Status: ${req.status} | Size: ${req.size} | Type: ${req.ct}`);
-        console.log('---');
-        console.log(typeof req.body === 'string' ? req.body : JSON.stringify(req.body, null, 2));
-      } else {
-        console.log(`Captured ${items.length} API requests:\n`);
-        items.forEach((r, i) => {
-          const bodyPreview = r.body ? (typeof r.body === 'string' ? r.body.slice(0, 60) : JSON.stringify(r.body).slice(0, 60)) : '';
-          console.log(`  [${i}] ${r.method} ${r.status} ${r.url.slice(0, 80)}`);
-          if (bodyPreview) console.log(`      ${bodyPreview}...`);
-        });
-        console.log(`\nUse --detail <index> to see full response body.`);
-      }
+      console.log(JSON.stringify(envelope, null, 2));
     }));
 
   // ── Init (adapter scaffolding) ──
@@ -1459,8 +1536,3 @@ export function resolveBrowserVerifyInvocation(opts: {
   };
 }
 
-/** Infer a workspace-friendly hostname from a URL, with site override. */
-function inferHost(url: string, site?: string): string {
-  if (site) return site;
-  try { return new URL(url).host; } catch { return 'default'; }
-}
