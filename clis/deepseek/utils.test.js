@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { sendWithFile } from './utils.js';
+import { selectModel, sendWithFile } from './utils.js';
 
 describe('deepseek sendWithFile', () => {
   const tempDirs = [];
@@ -33,5 +33,30 @@ describe('deepseek sendWithFile', () => {
 
     expect(result).toEqual({ ok: true });
     expect(page.setFileInput).toHaveBeenCalledWith([filePath], 'input[type="file"]');
+  });
+});
+
+describe('deepseek selectModel', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete global.document;
+  });
+
+  it('fails expert selection when only one radio is present', async () => {
+    const instantRadio = {
+      getAttribute: vi.fn(() => 'true'),
+      click: vi.fn(),
+    };
+    global.document = {
+      querySelectorAll: vi.fn(() => [instantRadio]),
+    };
+    const page = {
+      evaluate: vi.fn(async (script) => eval(script)),
+    };
+
+    const result = await selectModel(page, 'expert');
+
+    expect(result).toEqual({ ok: false });
+    expect(instantRadio.click).not.toHaveBeenCalled();
   });
 });

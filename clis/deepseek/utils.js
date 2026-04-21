@@ -41,6 +41,7 @@ export async function selectModel(page, modelName) {
         var radios = document.querySelectorAll('div[role="radio"]');
         if (radios.length === 0) return { ok: false };
         var isFirst = '${modelName}'.toLowerCase() === 'instant';
+        if (!isFirst && radios.length < 2) return { ok: false };
         var target = isFirst ? radios[0] : radios[radios.length - 1];
         var alreadySelected = target.getAttribute('aria-checked') === 'true';
         if (!alreadySelected) target.click();
