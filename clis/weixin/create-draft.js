@@ -170,9 +170,9 @@ async function clickSaveDraft(page) {
     return false;
 }
 
-export const publishCommand = cli({
+export const createDraftCommand = cli({
     site: 'weixin',
-    name: 'publish',
+    name: 'create-draft',
     description: '创建微信公众号图文草稿',
     domain: WEIXIN_DOMAIN,
     strategy: Strategy.COOKIE,
