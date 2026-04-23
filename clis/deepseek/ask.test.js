@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { CommandExecutionError } from '@jackwener/opencli/errors';
+import { CliError, CommandExecutionError, EXIT_CODES } from '@jackwener/opencli/errors';
 
 const {
   mockEnsureOnDeepSeek,
@@ -218,6 +218,28 @@ describe('deepseek ask conversation resume', () => {
     });
 
     expect(rows).toEqual([{ response: 'follow-up reply' }]);
+    expect(mockSelectModel).not.toHaveBeenCalled();
+  });
+
+  it('fails fast when --model is explicitly requested inside an existing conversation', async () => {
+    mockEnsureOnDeepSeek.mockResolvedValue(false);
+    page.evaluate.mockResolvedValue('https://chat.deepseek.com/a/chat/s/abc-123');
+
+    await expect(askCommand.func(page, {
+      prompt: 'continue',
+      timeout: 120,
+      new: false,
+      model: 'expert',
+      think: false,
+      search: false,
+      __opencliOptionSources: { model: 'cli' },
+    })).rejects.toMatchObject(new CliError(
+      'ARGUMENT',
+      'Cannot switch to expert model inside an existing conversation.',
+      'Re-run with --new to start a fresh chat before selecting a model.',
+      EXIT_CODES.USAGE_ERROR,
+    ));
+
     expect(mockSelectModel).not.toHaveBeenCalled();
   });
 

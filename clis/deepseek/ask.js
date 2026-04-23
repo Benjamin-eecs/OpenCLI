@@ -1,5 +1,5 @@
 import { cli, Strategy } from '@jackwener/opencli/registry';
-import { CommandExecutionError } from '@jackwener/opencli/errors';
+import { CliError, CommandExecutionError, EXIT_CODES } from '@jackwener/opencli/errors';
 import {
     DEEPSEEK_DOMAIN, DEEPSEEK_URL, ensureOnDeepSeek, selectModel, setFeature,
     sendMessage, sendWithFile, getBubbleCount, waitForResponse, parseBoolFlag, withRetry,
@@ -53,9 +53,19 @@ export const askCommand = cli({
         // an existing conversation. Skip it when we resumed a prior thread.
         const currentUrl = await page.evaluate('window.location.href') || '';
         const inConversation = currentUrl.includes('/a/chat/s/');
+        const modelExplicit = kwargs.__opencliOptionSources?.model === 'cli';
+
+        const wantModel = kwargs.model || 'instant';
+        if (inConversation && modelExplicit) {
+            throw new CliError(
+                'ARGUMENT',
+                `Cannot switch to ${wantModel} model inside an existing conversation.`,
+                'Re-run with --new to start a fresh chat before selecting a model.',
+                EXIT_CODES.USAGE_ERROR,
+            );
+        }
 
         if (!inConversation) {
-            const wantModel = kwargs.model || 'instant';
             const modelResult = await withRetry(() => selectModel(page, wantModel));
             if (!modelResult?.ok) {
                 throw new CommandExecutionError(`Could not switch to ${wantModel} model`);
