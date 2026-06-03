@@ -9,6 +9,8 @@
  * page-scoped operations target the correct page without guessing.
  */
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import type { BrowserCookie, BrowserDownloadWaitResult, BrowserEvaluateFunction, ScreenshotOptions } from '../types.js';
 import { sendCommand, sendCommandFull } from './daemon-client.js';
 import { buildEvaluateExpression } from './utils.js';
@@ -17,7 +19,41 @@ import { generateStealthJs } from './stealth.js';
 import { waitForDomStableJs } from './dom-helpers.js';
 import { BasePage } from './base-page.js';
 import { classifyBrowserError } from './errors.js';
+import { ArgumentError } from '../errors.js';
 import { log } from '../logger.js';
+
+/**
+ * File-extension to MIME-type lookup used by `pasteFiles` to populate
+ * DataTransfer item types. Unknown extensions fall back to
+ * `application/octet-stream`, which browser paste handlers usually still
+ * accept because they sniff content themselves. Audio/video extensions are
+ * omitted on purpose: typical media files exceed the payload ceiling below.
+ */
+const CLIPBOARD_MIME_BY_EXT: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
+  '.svg': 'image/svg+xml',
+  '.pdf': 'application/pdf',
+  '.txt': 'text/plain',
+  '.md': 'text/markdown',
+  '.json': 'application/json',
+  '.csv': 'text/csv',
+  '.html': 'text/html',
+  '.htm': 'text/html',
+};
+
+/**
+ * Ceiling for the summed base64 size of a `pasteFiles` payload. The daemon
+ * destroys request bodies over 1 MB before parsing (MAX_BODY in daemon.ts),
+ * which surfaces client-side as an opaque socket error — so oversized files
+ * are rejected upfront with the real reason. Kept slightly under the cap to
+ * leave room for the rest of the JSON command body.
+ */
+const CLIPBOARD_FILES_MAX_BASE64_BYTES = 1000 * 1024;
 
 function isUnsupportedNetworkCaptureError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
@@ -325,6 +361,35 @@ export class Page extends BasePage {
     if (!result?.inserted) {
       throw new Error('insertText returned no inserted flag — command may not be supported by the extension');
     }
+  }
+
+  async pasteFiles(files: string[], selector?: string): Promise<{ count: number; delivered: boolean }> {
+    const clipboardFiles = files.map((filePath) => {
+      const absPath = path.resolve(filePath);
+      const buffer = fs.readFileSync(absPath);
+      const ext = path.extname(absPath).toLowerCase();
+      return {
+        name: path.basename(absPath),
+        mimeType: CLIPBOARD_MIME_BY_EXT[ext] ?? 'application/octet-stream',
+        base64: buffer.toString('base64'),
+      };
+    });
+    const payloadBytes = clipboardFiles.reduce((sum, file) => sum + file.base64.length, 0);
+    if (payloadBytes > CLIPBOARD_FILES_MAX_BASE64_BYTES) {
+      throw new ArgumentError(
+        `pasteFiles payload is ${Math.ceil(payloadBytes / 1024)} KB base64-encoded; the daemon rejects command bodies over 1 MB`,
+        'Use browser upload for large files — CDP reads them from the local filesystem.',
+      );
+    }
+    const result = await sendCommand('paste-files', {
+      clipboardFiles,
+      selector,
+      ...this._cmdOpts(),
+    }) as { count?: number; delivered?: boolean };
+    if (!result?.count) {
+      throw new Error('pasteFiles returned no count — command may not be supported by the extension');
+    }
+    return { count: result.count, delivered: result.delivered === true };
   }
 
   async frames(): Promise<Array<{ index: number; frameId: string; url: string; name: string }>> {

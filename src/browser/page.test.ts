@@ -1,3 +1,6 @@
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { sendCommandMock, sendCommandFullMock } = vi.hoisted(() => ({
@@ -19,6 +22,7 @@ vi.mock('../logger.js', () => ({
 }));
 
 import { Page } from './page.js';
+import { ArgumentError } from '../errors.js';
 
 describe('Page.getCurrentUrl', () => {
   beforeEach(() => {
@@ -505,5 +509,78 @@ describe('Page.screenshot', () => {
     expect(args.width).toBeUndefined();
     expect(args.height).toBeUndefined();
     expect(args.fullPage).toBeUndefined();
+  });
+});
+
+describe('Page.pasteFiles', () => {
+  beforeEach(() => {
+    sendCommandMock.mockReset();
+    sendCommandFullMock.mockReset();
+    warnMock.mockReset();
+  });
+
+  it('base64-encodes provided files and forwards them as clipboardFiles', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-paste-'));
+    const filePath = path.join(dir, 'note.png');
+    fs.writeFileSync(filePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+
+    try {
+      sendCommandMock.mockResolvedValueOnce({ count: 1, delivered: true });
+
+      const page = new Page('default');
+      await expect(page.pasteFiles([filePath], '#composer')).resolves.toEqual({ count: 1, delivered: true });
+
+      const call = sendCommandMock.mock.calls.at(-1);
+      expect(call?.[0]).toBe('paste-files');
+      const args = call?.[1] as Record<string, unknown>;
+      expect(args.selector).toBe('#composer');
+      expect(args.clipboardFiles).toEqual([
+        { name: 'note.png', mimeType: 'image/png', base64: 'iVBORw==' },
+      ]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports delivered:false when no page listener consumed the paste', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-paste-'));
+    const filePath = path.join(dir, 'note.txt');
+    fs.writeFileSync(filePath, 'hi');
+
+    try {
+      sendCommandMock.mockResolvedValueOnce({ count: 1, delivered: false });
+      const page = new Page('default');
+      await expect(page.pasteFiles([filePath])).resolves.toEqual({ count: 1, delivered: false });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a payload over the daemon body cap before reaching the daemon', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-paste-'));
+    const filePath = path.join(dir, 'big.bin');
+    fs.writeFileSync(filePath, Buffer.alloc(1024 * 1024));
+
+    try {
+      const page = new Page('default');
+      await expect(page.pasteFiles([filePath])).rejects.toBeInstanceOf(ArgumentError);
+      expect(sendCommandMock).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('throws when the extension returns no count (unsupported action)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencli-paste-'));
+    const filePath = path.join(dir, 'note.txt');
+    fs.writeFileSync(filePath, 'hi');
+
+    try {
+      sendCommandMock.mockResolvedValueOnce({});
+      const page = new Page('default');
+      await expect(page.pasteFiles([filePath])).rejects.toThrow(/no count/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

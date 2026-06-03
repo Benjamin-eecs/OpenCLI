@@ -133,6 +133,14 @@ export interface IPage {
    * Useful for rich editors that ignore synthetic DOM value/text mutations.
    */
   insertText?(text: string): Promise<void>;
+  /**
+   * Paste local files into the focused element (or the optional `selector`)
+   * by dispatching a synthesized ClipboardEvent('paste') with a DataTransfer
+   * payload built from the file contents. Use for web apps whose upload flow
+   * only listens to clipboard paste. `delivered` is true when a page listener
+   * cancelled the event, i.e. actually consumed the pasted files.
+   */
+  pasteFiles?(files: string[], selector?: string): Promise<{ count: number; delivered: boolean }>;
   closeWindow?(): Promise<void>;
   /** Returns the current page URL, or null if unavailable. */
   getCurrentUrl?(): Promise<string | null>;

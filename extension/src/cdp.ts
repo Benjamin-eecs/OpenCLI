@@ -609,6 +609,70 @@ export async function insertText(
   await sendDebuggerCommand({ tabId }, 'Input.insertText', { text });
 }
 
+/**
+ * Dispatch a synthesized ClipboardEvent('paste') with a DataTransfer payload
+ * built from the supplied files on the currently focused element, or on the
+ * element matched by `selector` when provided. Targets web apps whose upload
+ * flow only listens to clipboard paste events.
+ *
+ * @param tabId - Target tab ID
+ * @param files - Array of file entries (name, mimeType, base64 content)
+ * @param selector - Optional CSS selector for the paste target; defaults to document.activeElement
+ */
+export async function pasteClipboardFiles(
+  tabId: number,
+  files: Array<{ name: string; mimeType: string; base64: string }>,
+  selector?: string,
+): Promise<{ count: number; delivered: boolean }> {
+  await ensureAttached(tabId);
+  const targetExpr = selector
+    ? `document.querySelector(${JSON.stringify(selector)})`
+    : 'document.activeElement && document.activeElement !== document.body ? document.activeElement : document.body';
+  const expression = `
+    (() => {
+      const target = ${targetExpr};
+      if (!target) return { ok: false };
+      const files = ${JSON.stringify(files)};
+      const dt = new DataTransfer();
+      for (const f of files) {
+        const binary = atob(f.base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const blob = new Blob([bytes], { type: f.mimeType });
+        dt.items.add(new File([blob], f.name, { type: f.mimeType }));
+      }
+      const event = new ClipboardEvent('paste', {
+        clipboardData: dt,
+        bubbles: true,
+        cancelable: true,
+      });
+      // dispatchEvent returns false when a listener cancelled the event — for
+      // a file paste that cancellation is the only signal an app-level handler
+      // consumed the files (the browser default does nothing with them).
+      const delivered = !target.dispatchEvent(event);
+      return { ok: true, count: files.length, delivered };
+    })()
+  `;
+  const result = await sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+  }) as {
+    result?: { value?: { ok?: boolean; count?: number; delivered?: boolean } };
+    exceptionDetails?: { exception?: { description?: string }; text?: string };
+  };
+  if (result.exceptionDetails) {
+    const description = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? 'Unknown error';
+    throw new Error(`paste-files evaluate failed: ${description}`);
+  }
+  const value = result.result?.value;
+  if (!value?.ok) {
+    throw new Error(selector
+      ? `No element found matching selector: ${selector}`
+      : 'Page has no document.body to receive the paste event');
+  }
+  return { count: value.count ?? files.length, delivered: value.delivered === true };
+}
+
 export function registerFrameTracking(): void {
   registerFrameTargetCleanup();
   chrome.debugger.onEvent.addListener((source, method, params: any) => {
