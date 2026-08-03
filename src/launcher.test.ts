@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { ElectronAppEntry } from './electron-apps.js';
+import { builtinApps, type ElectronAppEntry } from './electron-apps.js';
 import { detectProcess, discoverAppPath, electronLaunchArgs, launchDetachedApp, launchElectronApp, probeCDP, resolveExecutableCandidates } from './launcher.js';
 
 interface MockChildProcess {
@@ -131,6 +131,13 @@ describe('resolveExecutableCandidates', () => {
     expect(resolveExecutableCandidates('/Applications/Antigravity.app', app)).toEqual([
       '/Applications/Antigravity.app/Contents/MacOS/Electron',
       '/Applications/Antigravity.app/Contents/MacOS/Antigravity',
+    ]);
+  });
+
+  it('resolves the Codex bundle to both the legacy and current executable names', () => {
+    expect(resolveExecutableCandidates('/Applications/Codex.app', builtinApps.codex)).toEqual([
+      '/Applications/Codex.app/Contents/MacOS/Codex',
+      '/Applications/Codex.app/Contents/MacOS/ChatGPT',
     ]);
   });
 });
