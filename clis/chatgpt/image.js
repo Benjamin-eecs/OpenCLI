@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { cli, Strategy } from '@jackwener/opencli/registry';
 import { saveBase64ToFile } from '@jackwener/opencli/utils';
-import { ArgumentError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
+import { ArgumentError, CommandExecutionError, EmptyResultError, TimeoutError } from '@jackwener/opencli/errors';
 import { clearChatGPTDraft, getChatGPTVisibleImageUrls, navigateToProject, normalizeBooleanFlag, prepareChatGPTImagePaths, sendChatGPTMessage, unwrapEvaluateResult, waitForChatGPTImages, getChatGPTImageAssets, uploadChatGPTImages } from './utils.js';
 
 const CHATGPT_DOMAIN = 'chatgpt.com';
@@ -134,11 +134,14 @@ export const imageCommand = cli({
             convUrl = await currentChatGPTLink(page);
         }
 
-        const urls = await waitForChatGPTImages(page, beforeUrls, timeout, convUrl);
+        const { urls, settled } = await waitForChatGPTImages(page, beforeUrls, timeout, convUrl);
         const link = convUrl;
 
         if (!urls.length) {
             throw new EmptyResultError('chatgpt image', `No generated images were detected before timeout. Open ${link} and verify whether ChatGPT finished generating the image.`);
+        }
+        if (!settled) {
+            throw new TimeoutError('chatgpt image', timeout, `The image was still rendering when the timeout hit. Open ${link} to see it, or re-run with a higher --timeout.`);
         }
 
         if (skipDownload) {

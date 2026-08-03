@@ -2645,7 +2645,9 @@ export async function getChatGPTVisibleImageUrls(page) {
 }
 
 /**
- * Wait for new images to appear after sending a prompt.
+ * Wait for new images to appear after sending a prompt. Returns `settled: false`
+ * when the polls ran out before the image list stopped changing, so a still
+ * rendering image is not mistaken for a finished one.
  */
 export async function waitForChatGPTImages(page, beforeUrls, timeoutSeconds, convUrl) {
     const beforeSet = new Set(beforeUrls);
@@ -2689,11 +2691,13 @@ export async function waitForChatGPTImages(page, beforeUrls, timeoutSeconds, con
             stableCount = 1;
         }
 
-        if (stableCount >= 2 || i === maxPolls - 1) {
-            return lastUrls;
+        if (stableCount >= 2) {
+            return { urls: lastUrls, settled: true };
         }
     }
-    return lastUrls;
+    // Polls ran out. `lastUrls` may hold an image that is still rendering, so the
+    // caller must not present it as a finished result.
+    return { urls: lastUrls, settled: false };
 }
 
 /**

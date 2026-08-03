@@ -59,7 +59,7 @@ beforeEach(() => {
     mocks.sendChatGPTMessage.mockReset().mockResolvedValue(true);
     mocks.uploadChatGPTImages.mockReset().mockResolvedValue({ ok: true });
     mocks.navigateToProject.mockReset().mockResolvedValue(undefined);
-    mocks.waitForChatGPTImages.mockReset().mockResolvedValue(['https://images.example/generated.png']);
+    mocks.waitForChatGPTImages.mockReset().mockResolvedValue({ urls: ['https://images.example/generated.png'], settled: true });
     mocks.getChatGPTImageAssets.mockReset().mockResolvedValue([{
         url: 'https://images.example/generated.png',
         dataUrl: 'data:image/png;base64,aGVsbG8=',
@@ -177,7 +177,7 @@ describe('chatgpt image failure contracts', () => {
     });
 
     it('fails fast when image generation detection finds no new images', async () => {
-        mocks.waitForChatGPTImages.mockResolvedValue([]);
+        mocks.waitForChatGPTImages.mockResolvedValue({ urls: [], settled: false });
 
         await expect(imageCommand.func(createPage(), {
             prompt: 'cat',
@@ -189,6 +189,21 @@ describe('chatgpt image failure contracts', () => {
             message: expect.stringContaining('chatgpt image returned no data'),
             hint: expect.stringContaining('No generated images were detected'),
         });
+    });
+
+    it('does not report an unfinished image as saved', async () => {
+        mocks.waitForChatGPTImages.mockResolvedValue({ urls: ['https://images.example/partial.png'], settled: false });
+
+        await expect(imageCommand.func(createPage(), {
+            prompt: 'cat',
+            op: '',
+            sd: false,
+            timeout: 240,
+        })).rejects.toMatchObject({
+            code: 'TIMEOUT',
+            hint: expect.stringContaining('still rendering'),
+        });
+        expect(mocks.getChatGPTImageAssets).not.toHaveBeenCalled();
     });
 
     it('fails fast when generated image assets cannot be exported', async () => {

@@ -64,7 +64,7 @@ describe('chatgpt image wait contract', () => {
             generating: [true, true, true, true, true, true],
         });
 
-        await expect(waitForChatGPTImages(page, [], 18, convUrl)).resolves.toEqual([]);
+        await expect(waitForChatGPTImages(page, [], 18, convUrl)).resolves.toEqual({ urls: [], settled: false });
         expect(page.goto).not.toHaveBeenCalled();
     });
 
@@ -76,10 +76,46 @@ describe('chatgpt image wait contract', () => {
             imageUrls: [['https://cdn.openai.com/generated/demo.png']],
         });
 
-        await expect(waitForChatGPTImages(page, [], 3, convUrl)).resolves.toEqual([
-            'https://cdn.openai.com/generated/demo.png',
-        ]);
+        await expect(waitForChatGPTImages(page, [], 3, convUrl)).resolves.toEqual({
+            urls: ['https://cdn.openai.com/generated/demo.png'],
+            settled: false,
+        });
         expect(page.goto).toHaveBeenCalledWith(convUrl);
+    });
+
+    it('settles once the image list repeats', async () => {
+        const convUrl = 'https://chatgpt.com/c/demo';
+        const page = createPageMock({
+            location: convUrl,
+            generating: [false, false, false],
+            imageUrls: [
+                ['https://cdn.openai.com/generated/final.png'],
+                ['https://cdn.openai.com/generated/final.png'],
+            ],
+        });
+
+        await expect(waitForChatGPTImages(page, [], 30, convUrl)).resolves.toEqual({
+            urls: ['https://cdn.openai.com/generated/final.png'],
+            settled: true,
+        });
+    });
+
+    it('reports settled:false when the image list is still changing at timeout', async () => {
+        const convUrl = 'https://chatgpt.com/c/demo';
+        const page = createPageMock({
+            location: convUrl,
+            generating: [false, false, false],
+            imageUrls: [
+                ['https://cdn.openai.com/generated/partial-1.png'],
+                ['https://cdn.openai.com/generated/partial-2.png'],
+                ['https://cdn.openai.com/generated/partial-3.png'],
+            ],
+        });
+
+        await expect(waitForChatGPTImages(page, [], 9, convUrl)).resolves.toEqual({
+            urls: ['https://cdn.openai.com/generated/partial-3.png'],
+            settled: false,
+        });
     });
 
     it('treats query and hash variants as the same conversation', () => {
