@@ -150,22 +150,6 @@ async function loadFromManifest(manifestPath: string, clisDir: string): Promise<
 }
 
 /**
- * v1.7.0 stopped loading `.yaml` adapters and promised a deprecation warning
- * that was never wired up, so a directory of them drops out of `opencli list`
- * with no diagnostic at all. Warn once per directory rather than once per file,
- * because these directories routinely hold hundreds of adapters and `warn` is
- * unconditional.
- */
-function warnIgnoredYamlAdapters(dir: string, files: string[]): void {
-  const ignored = files.filter((file) => file.endsWith('.yaml') || file.endsWith('.yml'));
-  if (ignored.length === 0) return;
-  log.warn(
-    `Ignoring ${ignored.length} YAML adapter${ignored.length === 1 ? '' : 's'} in ${dir}: `
-    + '.yaml adapters are no longer loaded. Convert them to .js with the cli() API.',
-  );
-}
-
-/**
  * Fallback: traditional filesystem scan (used during development with tsx).
  */
 async function discoverClisFromFs(dir: string): Promise<void> {
@@ -178,7 +162,7 @@ async function discoverClisFromFs(dir: string): Promise<void> {
       const site = entry.name;
       const siteDir = path.join(dir, site);
       const files = await fs.promises.readdir(siteDir);
-      warnIgnoredYamlAdapters(siteDir, files);
+      warnIgnoredYamlAdapters(siteDir, new Set(files));
       await Promise.all(files.map(async (file) => {
         const filePath = path.join(siteDir, file);
         if (file.endsWith('.yaml') || file.endsWith('.yml')) {
@@ -220,8 +204,8 @@ export async function discoverPlugins(): Promise<void> {
  */
 async function discoverPluginDir(dir: string, site: string): Promise<void> {
   const files = await fs.promises.readdir(dir);
-  warnIgnoredYamlAdapters(dir, files);
   const fileSet = new Set(files);
+  warnIgnoredYamlAdapters(dir, fileSet);
   await Promise.all(files.map(async (file) => {
     const filePath = path.join(dir, file);
     if (file.endsWith('.yaml') || file.endsWith('.yml')) {
@@ -246,6 +230,17 @@ async function discoverPluginDir(dir: string, site: string): Promise<void> {
       );
     }
   }));
+}
+
+/**
+ * Warn once per directory for `.yaml` adapters that are skipped without a `.js`
+ * replacement beside them, so a directory of them cannot vanish silently.
+ */
+function warnIgnoredYamlAdapters(dir: string, files: Set<string>): void {
+  const ignored = [...files].filter((file) => (file.endsWith('.yaml') || file.endsWith('.yml'))
+    && !files.has(file.replace(/\.ya?ml$/, '.js')));
+  if (ignored.length === 0) return;
+  log.warn(`Ignoring ${ignored.length} YAML adapter${ignored.length === 1 ? '' : 's'} in ${dir} — .yaml adapters are no longer loaded. Convert them to .js with the cli() API.`);
 }
 
 async function isCliModule(filePath: string): Promise<boolean> {

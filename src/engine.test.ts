@@ -76,6 +76,32 @@ cli({
     }
   });
 
+  it('stays silent for a yaml adapter that already has a .js replacement beside it', async () => {
+    const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-migrated-'));
+    const siteDir = path.join(tempRoot, 'migrated-site');
+    const writes: string[] = [];
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    });
+
+    try {
+      await fs.promises.mkdir(siteDir, { recursive: true });
+      await fs.promises.writeFile(path.join(siteDir, 'done.yaml'), 'name: done\n');
+      await fs.promises.writeFile(path.join(siteDir, 'done.js'), 'export const migrated = true;\n');
+      await fs.promises.writeFile(path.join(siteDir, 'pending.yml'), 'name: pending\n');
+
+      await discoverClis(tempRoot);
+
+      const warnings = writes.filter((line) => line.includes('YAML adapter'));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('Ignoring 1 YAML adapter ');
+    } finally {
+      stderr.mockRestore();
+      await fs.promises.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it('stays silent for a site directory with no yaml adapters', async () => {
     const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-none-'));
     const siteDir = path.join(tempRoot, 'js-only-site');
@@ -250,8 +276,13 @@ strategy: public
 browser: false
 `);
     await fs.promises.symlink(symlinkTargetDir, symlinkPluginDir, dirSymlinkType);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
 
-    await discoverPlugins();
+    try {
+      await discoverPlugins();
+    } finally {
+      stderr.mockRestore();
+    }
 
     const cmd = getRegistry().get('__test-plugin-symlink__/hello');
     expect(cmd).toBeUndefined();
