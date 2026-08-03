@@ -30,9 +30,7 @@ export const builtinApps: Record<string, ElectronAppEntry> = {
   codex:         {
     port: 9238,
     processName: 'Codex',
-    // Codex ships from the ChatGPT desktop bundle, so the executable inside
-    // Codex.app is named ChatGPT on current builds.
-    executableNames: ['Codex', 'ChatGPT'],
+    executableNames: ['ChatGPT', 'Codex'],
     bundleId: 'com.openai.codex',
     displayName: 'Codex',
   },
