@@ -49,6 +49,55 @@ cli({
     }
   });
 
+  it('warns once per site directory that holds skipped yaml adapters', async () => {
+    const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-skip-'));
+    const siteDir = path.join(tempRoot, 'yaml-site');
+    const writes: string[] = [];
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    });
+
+    try {
+      await fs.promises.mkdir(siteDir, { recursive: true });
+      await fs.promises.writeFile(path.join(siteDir, 'one.yaml'), 'name: one\n');
+      await fs.promises.writeFile(path.join(siteDir, 'two.yml'), 'name: two\n');
+
+      await discoverClis(tempRoot);
+
+      const warnings = writes.filter((line) => line.includes('YAML adapter'));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('Ignoring 2 YAML adapters');
+      expect(warnings[0]).toContain(siteDir);
+      expect(warnings[0]).toContain('cli() API');
+    } finally {
+      stderr.mockRestore();
+      await fs.promises.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('stays silent for a site directory with no yaml adapters', async () => {
+    const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-none-'));
+    const siteDir = path.join(tempRoot, 'js-only-site');
+    const writes: string[] = [];
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    });
+
+    try {
+      await fs.promises.mkdir(siteDir, { recursive: true });
+      await fs.promises.writeFile(path.join(siteDir, 'notes.md'), '# notes\n');
+
+      await discoverClis(tempRoot);
+
+      expect(writes.filter((line) => line.includes('YAML adapter'))).toEqual([]);
+    } finally {
+      stderr.mockRestore();
+      await fs.promises.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it('falls back to filesystem discovery when the manifest is invalid', async () => {
     const tempBuildRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-manifest-fallback-'));
     const distDir = path.join(tempBuildRoot, 'dist');
@@ -166,12 +215,23 @@ description: Test plugin greeting
 strategy: public
 browser: false
 `);
+    const writes: string[] = [];
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    });
 
-    await discoverPlugins();
+    try {
+      await discoverPlugins();
+    } finally {
+      stderr.mockRestore();
+    }
 
     const registry = getRegistry();
     const cmd = registry.get('__test-plugin__/greeting');
     expect(cmd).toBeUndefined();
+    const warnings = writes.filter((line) => line.includes('YAML adapter') && line.includes(testPluginDir));
+    expect(warnings).toHaveLength(1);
   });
 
   it('handles non-existent plugins directory gracefully', async () => {
