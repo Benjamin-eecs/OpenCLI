@@ -1,4 +1,5 @@
 import { cli } from '@jackwener/opencli/registry';
+import { buildResolveInstagramUserIdJs } from './_shared/user-id.js';
 cli({
     site: 'instagram',
     name: 'followers',
@@ -18,14 +19,7 @@ cli({
   const headers = { 'X-IG-App-ID': '936619743392459' };
   const opts = { credentials: 'include', headers };
 
-  const r1 = await fetch(
-    'https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(username),
-    opts
-  );
-  if (!r1.ok) throw new Error('HTTP ' + r1.status + ' - make sure you are logged in to Instagram');
-  const d1 = await r1.json();
-  const userId = d1?.data?.user?.id;
-  if (!userId) throw new Error('User not found: ' + username);
+  ${buildResolveInstagramUserIdJs()}
 
   const r2 = await fetch(
     'https://www.instagram.com/api/v1/friendships/' + userId + '/followers/?count=' + limit,
