@@ -1,4 +1,5 @@
 import { cli, Strategy } from '@jackwener/opencli/registry';
+import { EmptyResultError } from '@jackwener/opencli/errors';
 export const extractDiffCommand = cli({
     site: 'codex',
     name: 'extract-diff',
@@ -38,7 +39,7 @@ export const extractDiffCommand = cli({
       })()
     `);
         if (diffs.length === 0) {
-            return [{ File: 'No diffs found', Diff: 'Try running opencli codex send "/review" first' }];
+            throw new EmptyResultError('codex extract-diff', 'No Codex diffs were visible. Run opencli codex send "/review" --pick "Review Agent" and retry.');
         }
         return diffs;
     },
