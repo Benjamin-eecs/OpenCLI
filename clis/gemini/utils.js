@@ -1,4 +1,4 @@
-import { CommandExecutionError } from '@jackwener/opencli/errors';
+import { CommandExecutionError, TimeoutError } from '@jackwener/opencli/errors';
 export const GEMINI_DOMAIN = 'gemini.google.com';
 export const GEMINI_APP_URL = 'https://gemini.google.com/app';
 export const GEMINI_DEEP_RESEARCH_DEFAULT_TOOL_LABELS = ['Deep Research', 'Deep research', '\u6df1\u5ea6\u7814\u7a76'];
@@ -298,20 +298,24 @@ function getStateScript() {
     })()
   `;
 }
-function readGeminiSnapshotScript() {
-    return `
-    (() => {
-      ${buildGeminiComposerLocatorScript()}
-      const composer = findComposer();
-      const composerText = composer?.textContent?.replace(/\\u00a0/g, ' ').trim() || '';
-      const isGenerating = !!Array.from(document.querySelectorAll('button, [role="button"]')).find((node) => {
+/** Expression yielding whether the stop-response control is mounted. */
+function isGeneratingExpression() {
+    return `!!Array.from(document.querySelectorAll('button, [role="button"]')).find((node) => {
         const text = (node.textContent || '').trim().toLowerCase();
         const aria = (node.getAttribute('aria-label') || '').trim().toLowerCase();
         return text === 'stop response'
           || aria === 'stop response'
           || text === '停止回答'
           || aria === '停止回答';
-      });
+      })`;
+}
+function readGeminiSnapshotScript() {
+    return `
+    (() => {
+      ${buildGeminiComposerLocatorScript()}
+      const composer = findComposer();
+      const composerText = composer?.textContent?.replace(/\\u00a0/g, ' ').trim() || '';
+      const isGenerating = ${isGeneratingExpression()};
       const turns = ${getTurnsScript().trim()};
       const transcriptLines = ${getTranscriptLinesScript().trim()};
 
@@ -2346,6 +2350,10 @@ export async function getGeminiVisibleImageUrls(page) {
         const height = img.naturalHeight || img.height || 0;
         if (!src) continue;
         if (alt.includes('avatar') || alt.includes('logo') || alt.includes('icon')) continue;
+        // A placeholder still streaming its bytes reports complete false and
+        // naturalWidth 0 while laying out at full size, so the size gate below
+        // would accept it and the export step would save a blank frame (#2245).
+        if (!img.complete || !img.naturalWidth) continue;
         if (width < 128 && height < 128) continue;
         if (seen.has(src)) continue;
         seen.add(src);
@@ -2355,14 +2363,29 @@ export async function getGeminiVisibleImageUrls(page) {
     })()
   `);
 }
+/** Cheap generation probe: the snapshot read walks the whole transcript. */
+export async function isGeminiGenerating(page) {
+    const value = await page.evaluate(`(() => ${isGeneratingExpression()})()`).catch(() => null);
+    return typeof value === 'boolean' ? value : null;
+}
 export async function waitForGeminiImages(page, beforeUrls, timeoutSeconds) {
     const beforeSet = new Set(beforeUrls);
     const pollIntervalSeconds = 3;
     const maxPolls = Math.max(1, Math.ceil(timeoutSeconds / pollIntervalSeconds));
     let lastUrls = [];
     let stableCount = 0;
+    let stillGenerating = false;
     for (let index = 0; index < maxPolls; index += 1) {
         await page.wait(index === 0 ? 2 : pollIntervalSeconds);
+        // The text waits already gate on this signal; without it the image wait
+        // can settle on whatever is on screen mid-generation (#2245). An
+        // unreadable probe keeps the last known state so the deadline still
+        // reports the right typed error.
+        const generating = await isGeminiGenerating(page);
+        if (generating !== null)
+            stillGenerating = generating;
+        if (generating === true)
+            continue;
         const urls = (await getGeminiVisibleImageUrls(page)).filter((url) => !beforeSet.has(url));
         if (urls.length === 0)
             continue;
@@ -2376,6 +2399,9 @@ export async function waitForGeminiImages(page, beforeUrls, timeoutSeconds) {
         }
         if (stableCount >= 2 || index === maxPolls - 1)
             return lastUrls;
+    }
+    if (!lastUrls.length && stillGenerating) {
+        throw new TimeoutError('gemini image', timeoutSeconds, 'Gemini was still generating at the deadline. Re-run with a higher --timeout.');
     }
     return lastUrls;
 }
@@ -2424,11 +2450,13 @@ export async function exportGeminiImages(page, urls) {
           }
         } catch {}
 
-        if (!dataUrl && img instanceof HTMLImageElement) {
+        // drawImage silently draws nothing for an image whose bytes have not
+        // decoded, so redrawing one would export a blank PNG (#2245).
+        if (!dataUrl && img instanceof HTMLImageElement && img.complete && img.naturalWidth) {
           try {
             const canvas = document.createElement('canvas');
-            canvas.width = img.naturalWidth || img.width;
-            canvas.height = img.naturalHeight || img.height;
+            canvas.width = img.naturalWidth;
+            canvas.height = img.naturalHeight;
             const ctx = canvas.getContext('2d');
             if (ctx) {
               ctx.drawImage(img, 0, 0);
@@ -2438,7 +2466,10 @@ export async function exportGeminiImages(page, urls) {
           } catch {}
         }
 
-        if (dataUrl) {
+        // A failed fetch can still resolve, so require image bytes rather than
+        // any truthy string: an HTML error body reaches here as text/html, and
+        // an empty canvas export as a payload-less data URL (#2245).
+        if (/^data:[^;,]+;base64,[A-Za-z0-9+/]+=*$/.test(dataUrl) && String(mimeType).startsWith('image/')) {
           results.push({ url: String(targetUrl), dataUrl, mimeType, width, height });
         }
       }
