@@ -4,13 +4,32 @@ import * as path from 'node:path';
 import { cli, Strategy } from '@jackwener/opencli/registry';
 import { ArgumentError, AuthRequiredError, CliError, CommandExecutionError, EXIT_CODES } from '@jackwener/opencli/errors';
 import { httpDownload } from '@jackwener/opencli/download';
-const INSTAGRAM_GRAPHQL_DOC_ID = '8845758582119845';
-const INSTAGRAM_GRAPHQL_APP_ID = '936619743392459';
+const INSTAGRAM_APP_ID = '936619743392459';
 const INSTAGRAM_HOST_SUFFIX = 'instagram.com';
+const INSTAGRAM_SHORTCODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 const SUPPORTED_KINDS = new Set(['p', 'reel', 'tv']);
 function displayPath(filePath) {
     const home = os.homedir();
     return filePath.startsWith(home) ? `~${filePath.slice(home.length)}` : filePath;
+}
+export function resolveOutputDir(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return path.join(os.homedir(), 'Downloads', 'Instagram');
+    if (raw === '~') return os.homedir();
+    if (raw.startsWith('~/')) return path.join(os.homedir(), raw.slice(2));
+    return path.resolve(raw);
+}
+/** A shortcode is the media id written in Instagram's base64 alphabet. */
+export function shortcodeToMediaId(shortcode) {
+    const raw = String(shortcode || '');
+    if (!raw) return '';
+    let mediaId = 0n;
+    for (const character of raw) {
+        const digit = INSTAGRAM_SHORTCODE_ALPHABET.indexOf(character);
+        if (digit < 0) return '';
+        mediaId = mediaId * 64n + BigInt(digit);
+    }
+    return mediaId.toString();
 }
 export function parseInstagramMediaTarget(input) {
     const raw = String(input || '').trim();
@@ -45,6 +64,9 @@ export function parseInstagramMediaTarget(input) {
     if (!kind || !shortcode) {
         throw new ArgumentError(`Unsupported Instagram media URL: ${raw}`, 'Only /p/<shortcode>/, /reel/<shortcode>/, and /tv/<shortcode>/ links are supported');
     }
+    if (!shortcodeToMediaId(shortcode)) {
+        throw new ArgumentError(`Invalid Instagram shortcode: ${shortcode}`, 'Copy the link straight from the post, without escaping it');
+    }
     return {
         kind: kind,
         shortcode,
@@ -74,22 +96,19 @@ export function buildInstagramDownloadItems(shortcode, items) {
     });
 }
 export function buildInstagramFetchScript(shortcode) {
+    // The persisted GraphQL query this used to send now answers HTTP 200 with
+    // an execution error and no media, which read as a private post (#2247).
+    // The media info endpoint carries the same fields and needs no rotating id.
     return `
     (async () => {
       const shortcode = ${JSON.stringify(shortcode)};
-      const docId = ${JSON.stringify(INSTAGRAM_GRAPHQL_DOC_ID)};
-      const variables = {
-        shortcode,
-        fetch_tagged_user_count: null,
-        hoisted_comment_id: null,
-        hoisted_reply_id: null,
-      };
-      const url = 'https://www.instagram.com/graphql/query/?doc_id=' + docId + '&variables=' + encodeURIComponent(JSON.stringify(variables));
+      const mediaId = ${JSON.stringify(shortcodeToMediaId(shortcode))};
+      const url = 'https://www.instagram.com/api/v1/media/' + mediaId + '/info/';
       const res = await fetch(url, {
         credentials: 'include',
         headers: {
           'Accept': 'application/json,text/plain,*/*',
-          'X-IG-App-ID': ${JSON.stringify(INSTAGRAM_GRAPHQL_APP_ID)},
+          'X-IG-App-ID': ${JSON.stringify(INSTAGRAM_APP_ID)},
         },
       });
       const rawText = await res.text();
@@ -115,7 +134,7 @@ export function buildInstagramFetchScript(shortcode) {
         if (res.status === 429) {
           return { ok: false, errorCode: 'RATE_LIMITED', error: message || 'HTTP 429' };
         }
-        if (res.status === 404 || res.status === 410) {
+        if (res.status === 404 || res.status === 410 || data?.status === 'fail') {
           return { ok: false, errorCode: 'PRIVATE_OR_UNAVAILABLE', error: message || ('HTTP ' + res.status) };
         }
         return { ok: false, errorCode: 'COMMAND_EXEC', error: message || ('HTTP ' + res.status) };
@@ -128,7 +147,7 @@ export function buildInstagramFetchScript(shortcode) {
         return { ok: false, errorCode: 'RATE_LIMITED', error: message || 'Instagram rate limit triggered' };
       }
 
-      const media = data?.data?.xdt_shortcode_media;
+      const media = Array.isArray(data?.items) ? data.items[0] : null;
       if (!media) {
         return {
           ok: false,
@@ -137,21 +156,25 @@ export function buildInstagramFetchScript(shortcode) {
         };
       }
 
-      const nodes = Array.isArray(media?.edge_sidecar_to_children?.edges) && media.edge_sidecar_to_children.edges.length > 0
-        ? media.edge_sidecar_to_children.edges.map((edge) => edge?.node).filter(Boolean)
+      const nodes = Array.isArray(media?.carousel_media) && media.carousel_media.length > 0
+        ? media.carousel_media
         : [media];
 
-      const items = nodes
-        .map((node) => ({
-          type: node?.is_video ? 'video' : 'image',
-          url: String(node?.is_video ? (node?.video_url || '') : (node?.display_url || '')),
-        }))
-        .filter((item) => item.url);
+      // Candidate order is not guaranteed, so pick the widest rather than the
+      // first, and keep the declared media_type: a video whose renditions are
+      // missing must yield no url instead of falling back to its cover image.
+      const widest = (candidates) => (Array.isArray(candidates) ? candidates : [])
+        .reduce((best, candidate) => !best || (Number(candidate?.width) || 0) > (Number(best?.width) || 0) ? candidate : best, null);
+      const pickUrl = (node) => node?.media_type === 2
+        ? { type: 'video', url: String(widest(node?.video_versions)?.url || '') }
+        : { type: 'image', url: String(widest(node?.image_versions2?.candidates)?.url || '') };
+
+      const items = nodes.map(pickUrl).filter((item) => item.url);
 
       return {
         ok: true,
-        shortcode: media.shortcode || shortcode,
-        owner: media?.owner?.username || '',
+        shortcode: media.code || shortcode,
+        owner: media?.user?.username || '',
         items,
       };
     })()
@@ -208,7 +231,7 @@ cli({
     func: async (page, kwargs) => {
         const browserPage = ensurePage(page);
         const target = parseInstagramMediaTarget(String(kwargs.url ?? ''));
-        const outputRoot = String(kwargs.path ?? path.join(os.homedir(), 'Downloads', 'Instagram'));
+        const outputRoot = resolveOutputDir(kwargs.path);
         await browserPage.goto(target.canonicalUrl);
         const fetchResult = normalizeFetchResult(await browserPage.evaluate(buildInstagramFetchScript(target.shortcode)));
         if (!fetchResult.ok)
