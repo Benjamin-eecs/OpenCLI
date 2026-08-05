@@ -211,7 +211,7 @@ async function submitTweet(page, text) {
         const normalize = s => String(s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
         const expectedText = normalize(expected);
         const visible = (el) => !!el && (el.offsetParent !== null || el.getClientRects().length > 0);
-        const statusUrl = (root = document) => {
+        const statusUrl = (root) => {
             const links = Array.from(root.querySelectorAll('a[href*="/status/"]'));
             for (const link of links) {
                 const href = link.href || link.getAttribute('href') || '';
@@ -241,7 +241,11 @@ async function submitTweet(page, text) {
             const hasMedia = !!document.querySelector('[data-testid="attachments"]')
                 || document.querySelectorAll('img[src^="blob:"], video[src^="blob:"]').length > 0;
             if (!composerStillHasText && !hasMedia) {
-                return { ok: true, message: 'Tweet posted successfully.', ...statusUrl() };
+                // No permalink here: the compose route is a modal over the home
+                // timeline, so the first /status/ link in the document belongs
+                // to somebody else's tweet (#2250). Only the toast carries a
+                // link that is attributable to this post.
+                return { ok: true, message: 'Tweet posted successfully.' };
             }
         }
         return { ok: false, message: 'Tweet submission did not complete before timeout.' };

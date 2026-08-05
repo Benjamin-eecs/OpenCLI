@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { JSDOM } from 'jsdom';
 import { getRegistry } from '@jackwener/opencli/registry';
 import './post.js';
 
@@ -215,6 +216,61 @@ describe('twitter post command', () => {
         const submitScript = page.evaluate.mock.calls[3][0];
         expect(submitScript).toContain('successToast');
         expect(submitScript).toContain('your post was sent');
+    });
+
+    // The compose route is a modal over the home timeline, so the submit
+    // script runs against that DOM instead of a stub.
+    const runPostAgainstDom = async (html, text) => {
+        const dom = new JSDOM(`<!doctype html><body>${html}</body>`, {
+            url: 'https://x.com/compose/post',
+            runScripts: 'outside-only',
+        });
+        dom.window.setTimeout = (callback) => {
+            callback();
+            return 0;
+        };
+        dom.window.HTMLElement.prototype.getClientRects = () => [{ width: 10, height: 10 }];
+        const page = makePage([
+            { ok: true }, // focus composer
+            { ok: true }, // verify native insertText
+            { ok: true }, // click post
+        ]);
+        page.evaluate.mockImplementation((script) => dom.window.eval(script)); // submit poll
+        return getCommand().func(page, { text });
+    };
+
+    it('reports no permalink when the post is confirmed by the cleared composer', async () => {
+        const timelineOnly = '<article><a href="/nasa/status/1111111111111111111">someone else</a></article>';
+
+        await expect(runPostAgainstDom(timelineOnly, 'cleared composer')).resolves.toEqual([
+            { status: 'success', message: 'Tweet posted successfully.', text: 'cleared composer' },
+        ]);
+    });
+
+    it('keeps the permalink that the success toast carries', async () => {
+        const toast = `
+            <article><a href="/nasa/status/1111111111111111111">someone else</a></article>
+            <div role="alert">Your post was sent. <a href="/me/status/2222222222222222222">View</a></div>
+        `;
+
+        await expect(runPostAgainstDom(toast, 'toast permalink')).resolves.toEqual([
+            {
+                status: 'success',
+                message: 'Tweet posted successfully.',
+                text: 'toast permalink',
+                id: '2222222222222222222',
+                url: 'https://x.com/me/status/2222222222222222222',
+            },
+        ]);
+    });
+
+    it('requires an explicit root for the permalink lookup', async () => {
+        const command = getCommand();
+        const page = makePage([{ ok: true }, { ok: true }, { ok: true }, { ok: true, message: 'Tweet posted successfully.' }]);
+
+        await command.func(page, { text: 'explicit root' });
+
+        expect(page.evaluate.mock.calls[3][0]).toContain('const statusUrl = (root) =>');
     });
 
     it('does not let global timeline tweetPhoto nodes keep the submit poll pending', async () => {
