@@ -38,7 +38,7 @@ function createPageMock({ feed, dom, onToggle } = {}) {
         goto: vi.fn().mockResolvedValue(undefined),
         sleep: vi.fn().mockResolvedValue(undefined),
         evaluate: vi.fn((script) => {
-            if (script.includes('/username/?count=')) return Promise.resolve(feed);
+            if (script.includes('/username/?count=')) return Promise.resolve(typeof feed === 'function' ? feed() : feed);
             if (!dom) return Promise.resolve(null);
             const result = dom.window.eval(script);
             if (script.includes('button.click()')) onToggle?.(dom);
@@ -47,7 +47,7 @@ function createPageMock({ feed, dom, onToggle } = {}) {
     };
 }
 
-const onePost = { items: [{ code: 'ABC123', caption: 'a caption', liked: false }] };
+const onePost = { ownerId: '42', items: [{ code: 'ABC123', pk: '98765', caption: 'a caption', liked: false }] };
 const args = { username: 'someone', index: 1 };
 
 describe('instagram post like page scripts', () => {
@@ -88,6 +88,13 @@ describe('instagram post like page scripts', () => {
         expect(dom.window.eval(buildToggleLikeJs(true))).toEqual({ found: false });
     });
 
+    it('finds no control when a full-size like icon lacks action-bar siblings', () => {
+        const dom = new JSDOM('<section><div role="button"><svg aria-label="Like"></svg></div></section>', { runScripts: 'outside-only' });
+        dom.window.document.querySelector('svg').getBoundingClientRect = () => ({ width: 24, height: 24 });
+
+        expect(dom.window.eval(buildToggleLikeJs(true))).toEqual({ found: false });
+    });
+
     it('finds no control when the full-size icon sits among many labeled comment icons', () => {
         const dom = new JSDOM(`
             <section>
@@ -111,16 +118,21 @@ describe('instagram post like page scripts', () => {
 describe('instagram post like', () => {
     it('reports success only after the flipped icon holds', async () => {
         const dom = createPostDom();
+        let feed = onePost;
         const page = createPageMock({
-            feed: onePost,
+            feed: () => feed,
             dom,
-            onToggle: (d) => d.window.document.querySelector('svg[data-kind="post"]').setAttribute('aria-label', 'Unlike'),
+            onToggle: (d) => {
+                d.window.document.querySelector('svg[data-kind="post"]').setAttribute('aria-label', 'Unlike');
+                feed = { ownerId: '42', items: [{ code: 'ABC123', pk: '98765', caption: 'a caption', liked: true }] };
+            },
         });
 
         await expect(setInstagramPostLike(page, args, true)).resolves.toEqual([
             { status: 'Liked', user: 'someone', post: 'a caption' },
         ]);
         expect(page.goto).toHaveBeenCalledWith('https://www.instagram.com/p/ABC123/', { settleMs: 2000 });
+        expect(page.evaluate.mock.calls.filter(([script]) => script.includes('/username/?count='))).toHaveLength(2);
     });
 
     it('typed-fails when the icon flips and then reverts', async () => {
@@ -149,8 +161,38 @@ describe('instagram post like', () => {
         expect(page.evaluate.mock.calls.filter(([script]) => script.includes('button.click()'))).toHaveLength(5);
     });
 
+    it('typed-fails when the DOM flips but the feed does not persist the state', async () => {
+        const dom = createPostDom();
+        const page = createPageMock({
+            feed: onePost,
+            dom,
+            onToggle: (d) => d.window.document.querySelector('svg[data-kind="post"]').setAttribute('aria-label', 'Unlike'),
+        });
+
+        await expect(setInstagramPostLike(page, args, true)).rejects.toThrow('Instagram did not persist the like on ABC123');
+    });
+
+    it('typed-fails when the feed changes to a different post after click', async () => {
+        const dom = createPostDom();
+        const page = createPageMock({
+            feed: onePost,
+            dom,
+            onToggle: (d) => d.window.document.querySelector('svg[data-kind="post"]').setAttribute('aria-label', 'Unlike'),
+        });
+        let reads = 0;
+        const inner = page.evaluate;
+        page.evaluate = vi.fn((script) => {
+            if (script.includes('/username/?count=') && ++reads === 2) {
+                return Promise.resolve({ ownerId: '42', items: [{ code: 'DIFFERENT', pk: '12345', caption: 'other', liked: true }] });
+            }
+            return inner(script);
+        });
+
+        await expect(setInstagramPostLike(page, args, true)).rejects.toThrow('Instagram post feed no longer shows the expected post ABC123 at index 1');
+    });
+
     it('skips the post page when the feed already shows the target state', async () => {
-        const page = createPageMock({ feed: { items: [{ code: 'ABC123', caption: 'a caption', liked: true }] } });
+        const page = createPageMock({ feed: { ownerId: '42', items: [{ code: 'ABC123', pk: '98765', caption: 'a caption', liked: true }] } });
 
         await expect(setInstagramPostLike(page, args, true)).resolves.toEqual([
             { status: 'Already liked', user: 'someone', post: 'a caption' },
@@ -160,10 +202,14 @@ describe('instagram post like', () => {
 
     it('unlikes through the same control and reports the reverse status', async () => {
         const dom = createPostDom({ actionBarLabel: 'Unlike', commentLabel: 'Unlike' });
+        let feed = { ownerId: '42', items: [{ code: 'ABC123', pk: '98765', caption: 'a caption', liked: true }] };
         const page = createPageMock({
-            feed: { items: [{ code: 'ABC123', caption: 'a caption', liked: true }] },
+            feed: () => feed,
             dom,
-            onToggle: (d) => d.window.document.querySelector('svg[data-kind="post"]').setAttribute('aria-label', 'Like'),
+            onToggle: (d) => {
+                d.window.document.querySelector('svg[data-kind="post"]').setAttribute('aria-label', 'Like');
+                feed = onePost;
+            },
         });
 
         await expect(setInstagramPostLike(page, args, false)).resolves.toEqual([
@@ -172,10 +218,10 @@ describe('instagram post like', () => {
     });
 
     it('names the running command in empty results', async () => {
-        await expect(setInstagramPostLike(createPageMock({ feed: { items: [] } }), { username: 'ghost', index: 1 }, true))
+        await expect(setInstagramPostLike(createPageMock({ feed: { ownerId: '42', items: [] } }), { username: 'ghost', index: 1 }, true))
             .rejects.toMatchObject({ message: 'instagram like returned no data', hint: expect.stringContaining('No visible posts for ghost') });
 
-        await expect(setInstagramPostLike(createPageMock({ feed: { items: [] } }), { username: 'ghost', index: 1 }, false))
+        await expect(setInstagramPostLike(createPageMock({ feed: { ownerId: '42', items: [] } }), { username: 'ghost', index: 1 }, false))
             .rejects.toMatchObject({ message: 'instagram unlike returned no data' });
 
         await expect(setInstagramPostLike(createPageMock({ feed: onePost }), { username: 'someone', index: 4 }, true))
@@ -190,11 +236,36 @@ describe('instagram post like', () => {
         expect(page.goto).not.toHaveBeenCalled();
     });
 
+    it('rejects an empty username before touching the page', async () => {
+        const page = createPageMock({ feed: onePost });
+
+        await expect(setInstagramPostLike(page, { username: '', index: 1 }, true))
+            .rejects.toThrow('username is required');
+        expect(page.evaluate).not.toHaveBeenCalled();
+    });
+
     it('separates a missing account from a transport failure', async () => {
         await expect(setInstagramPostLike(createPageMock({ feed: { error: 404 } }), { username: 'ghost', index: 1 }, true))
             .rejects.toMatchObject({ code: 'EMPTY_RESULT', hint: expect.stringContaining('No Instagram user named ghost') });
 
         await expect(setInstagramPostLike(createPageMock({ feed: { error: 429 } }), args, true))
             .rejects.toThrow('Instagram returned HTTP 429');
+
+        await expect(setInstagramPostLike(createPageMock({ feed: { error: 401 } }), args, true))
+            .rejects.toMatchObject({ code: 'AUTH_REQUIRED' });
+    });
+
+    it('typed-fails malformed feed payloads and rows', async () => {
+        await expect(setInstagramPostLike(createPageMock({ feed: { items: [] } }), args, true))
+            .rejects.toThrow('Instagram post feed returned no valid owner id for someone');
+
+        await expect(setInstagramPostLike(createPageMock({ feed: { ownerId: '42', items: null } }), args, true))
+            .rejects.toThrow('Instagram post feed returned malformed items for someone');
+
+        await expect(setInstagramPostLike(createPageMock({ feed: { ownerId: '42', items: [{ code: 'ABC123', pk: { bad: true }, liked: false }] } }), args, true))
+            .rejects.toThrow('Instagram post feed returned malformed post row for someone');
+
+        await expect(setInstagramPostLike(createPageMock({ feed: { ownerId: '42', items: [{ code: 'ABC123', pk: '98765' }] } }), args, true))
+            .rejects.toThrow('Instagram post feed returned malformed post row for someone');
     });
 });
