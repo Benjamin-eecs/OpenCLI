@@ -1,6 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ElectronAppEntry } from './electron-apps.js';
-import { detectProcess, discoverAppPath, electronLaunchArgs, launchDetachedApp, launchElectronApp, probeCDP, resolveExecutableCandidates } from './launcher.js';
+import {
+  detectAppProcess,
+  detectProcess,
+  discoverAppPath,
+  electronLaunchArgs,
+  findAppProcessPids,
+  killAppProcess,
+  launchDetachedApp,
+  launchElectronApp,
+  probeCDP,
+  resolveExecutableCandidates,
+} from './launcher.js';
 
 interface MockChildProcess {
   once: ReturnType<typeof vi.fn>;
@@ -135,6 +146,98 @@ describe('resolveExecutableCandidates', () => {
   });
 });
 
+describe('app-scoped process detection', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const codexApp: ElectronAppEntry = {
+    port: 9238,
+    processName: 'Codex',
+    executableNames: ['ChatGPT', 'Codex'],
+  };
+
+  function mockProcessTable(rows: Record<string, Array<{ pid: number; command: string }>>): void {
+    cp.execFileSync.mockImplementation((command, args) => {
+      const argv = args as string[];
+      if (command === 'pgrep') {
+        const processName = argv[1];
+        const pids = rows[processName]?.map((row) => row.pid) ?? [];
+        if (pids.length === 0) {
+          const err = new Error('exit 1') as Error & { status: number };
+          err.status = 1;
+          throw err;
+        }
+        return `${pids.join('\n')}\n`;
+      }
+
+      if (command === 'ps') {
+        const pid = Number.parseInt(argv[1], 10);
+        const row = Object.values(rows).flat().find((entry) => entry.pid === pid);
+        if (!row) throw new Error('process not found');
+        return `${row.command}\n`;
+      }
+
+      throw new Error(`unexpected command ${String(command)}`);
+    });
+  }
+
+  it('detects Codex when only the ChatGPT executable is running inside Codex.app', () => {
+    mockProcessTable({
+      ChatGPT: [{ pid: 101, command: '/Applications/Codex.app/Contents/MacOS/ChatGPT --remote-debugging-port=9238' }],
+    });
+
+    expect(detectAppProcess('/Applications/Codex.app', codexApp)).toBe(true);
+  });
+
+  it('detects Codex when only the legacy Codex executable is running', () => {
+    mockProcessTable({
+      Codex: [{ pid: 102, command: '/Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9238' }],
+    });
+
+    expect(detectAppProcess('/Applications/Codex.app', codexApp)).toBe(true);
+  });
+
+  it('returns both matching pids when both executable names are running in Codex.app', () => {
+    mockProcessTable({
+      ChatGPT: [{ pid: 101, command: '/Applications/Codex.app/Contents/MacOS/ChatGPT --remote-debugging-port=9238' }],
+      Codex: [{ pid: 102, command: '/Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9238' }],
+    });
+
+    expect(findAppProcessPids('/Applications/Codex.app', codexApp)).toEqual([101, 102]);
+  });
+
+  it('does not treat the separate ChatGPT desktop app as a running Codex process', () => {
+    mockProcessTable({
+      ChatGPT: [{ pid: 201, command: '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=9236' }],
+    });
+
+    expect(detectAppProcess('/Applications/Codex.app', codexApp)).toBe(false);
+  });
+
+  it('kills only executable pids scoped to the target app bundle', async () => {
+    mockProcessTable({
+      ChatGPT: [
+        { pid: 101, command: '/Applications/Codex.app/Contents/MacOS/ChatGPT' },
+        { pid: 201, command: '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT' },
+      ],
+    });
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      if (signal === 0) {
+        const err = new Error('missing') as NodeJS.ErrnoException;
+        err.code = 'ESRCH';
+        throw err;
+      }
+      return true;
+    });
+
+    await killAppProcess('/Applications/Codex.app', codexApp);
+
+    expect(killSpy).toHaveBeenCalledWith(101, 'SIGTERM');
+    expect(killSpy).not.toHaveBeenCalledWith(201, 'SIGTERM');
+  });
+});
+
 describe('electronLaunchArgs', () => {
   it('includes Chromium 142 WebSocket origin allow-list for auto-launched Electron apps', () => {
     expect(electronLaunchArgs(9234)).toEqual([
@@ -194,5 +297,51 @@ describe('launchElectronApp', () => {
       { detached: true, stdio: 'ignore' },
     );
     expect(secondChild.unref).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not fall back to the next executable when the first candidate fails for a non-ENOENT reason', async () => {
+    const firstChild = createMockChildProcess();
+    const app: ElectronAppEntry = {
+      port: 9238,
+      processName: 'Codex',
+      executableNames: ['ChatGPT', 'Codex'],
+    };
+
+    cp.spawn.mockImplementationOnce(() => {
+      queueMicrotask(() => firstChild.emit('error', Object.assign(new Error('permission denied'), { code: 'EACCES' })));
+      return firstChild as unknown as ReturnType<typeof cp.spawn>;
+    });
+
+    await expect(
+      launchElectronApp('/Applications/Codex.app', app, ['--remote-debugging-port=9238'], 'Codex'),
+    ).rejects.toThrow('Failed to launch Codex');
+
+    expect(cp.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('throws a typed all-candidates-missing error when every executable candidate is absent', async () => {
+    const firstChild = createMockChildProcess();
+    const secondChild = createMockChildProcess();
+    const app: ElectronAppEntry = {
+      port: 9238,
+      processName: 'Codex',
+      executableNames: ['ChatGPT', 'Codex'],
+    };
+
+    cp.spawn
+      .mockImplementationOnce(() => {
+        queueMicrotask(() => firstChild.emit('error', Object.assign(new Error('missing ChatGPT'), { code: 'ENOENT' })));
+        return firstChild as unknown as ReturnType<typeof cp.spawn>;
+      })
+      .mockImplementationOnce(() => {
+        queueMicrotask(() => secondChild.emit('error', Object.assign(new Error('missing Codex'), { code: 'ENOENT' })));
+        return secondChild as unknown as ReturnType<typeof cp.spawn>;
+      });
+
+    await expect(
+      launchElectronApp('/Applications/Codex.app', app, ['--remote-debugging-port=9238'], 'Codex'),
+    ).rejects.toThrow('Could not launch Codex: no compatible executable found');
+
+    expect(cp.spawn).toHaveBeenCalledTimes(2);
   });
 });
