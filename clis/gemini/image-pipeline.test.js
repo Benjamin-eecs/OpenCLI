@@ -116,6 +116,13 @@ describe('gemini image wait contract', () => {
         await expect(waitForGeminiImages(page, [], 9)).rejects.toThrow(/gemini image timed out/);
     });
 
+    it('drops candidate images if the generation probe resumes as still generating', async () => {
+        const page = createPageMock({ generating: [false, true, true] });
+        mountImage(page.dom, { src: 'https://lh3.googleusercontent.com/transient.png', naturalWidth: 1024, complete: true });
+
+        await expect(waitForGeminiImages(page, [], 9)).rejects.toThrow(/gemini image timed out/);
+    });
+
     it('returns the image once generation has stopped', async () => {
         const page = createPageMock({ generating: [false] });
         mountImage(page.dom, { src: 'https://lh3.googleusercontent.com/final.png', naturalWidth: 1024, complete: true });

@@ -2387,7 +2387,12 @@ export async function waitForGeminiImages(page, beforeUrls, timeoutSeconds) {
         const generating = await isGeminiGenerating(page);
         if (generating !== null)
             stillGenerating = generating;
-        if (generating === true)
+        if (generating === true) {
+            lastUrls = [];
+            stableCount = 0;
+            continue;
+        }
+        if (stillGenerating)
             continue;
         const urls = (await getGeminiVisibleImageUrls(page)).filter((url) => !beforeSet.has(url));
         if (urls.length === 0)
@@ -2403,7 +2408,7 @@ export async function waitForGeminiImages(page, beforeUrls, timeoutSeconds) {
         if (stableCount >= 2 || index === maxPolls - 1)
             return lastUrls;
     }
-    if (!lastUrls.length && stillGenerating) {
+    if (stillGenerating) {
         throw new TimeoutError('gemini image', timeoutSeconds, 'Gemini was still generating at the deadline. Re-run with a higher --timeout.');
     }
     return lastUrls;
