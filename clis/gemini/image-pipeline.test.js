@@ -28,6 +28,12 @@ function createPageMock({ generating = [false] } = {}) {
     };
 }
 
+function wrapEvaluate(page) {
+    const original = page.evaluate;
+    page.evaluate = vi.fn(async (script) => ({ session: 'site:gemini', data: await original(script) }));
+    return page;
+}
+
 /** Mount an image whose decode state and layout box are controlled per case. */
 function mountImage(dom, { src, naturalWidth, complete, box = 708 }) {
     dom.window.document.querySelector('main').innerHTML = `<img src="${src}" alt="AI generated">`;
@@ -85,6 +91,15 @@ describe('gemini image detection', () => {
             'https://lh3.googleusercontent.com/generated.png',
         ]);
     });
+
+    it('unwraps Browser Bridge envelopes before returning image URLs', async () => {
+        const page = wrapEvaluate(createPageMock());
+        mountImage(page.dom, { src: 'https://lh3.googleusercontent.com/generated.png', naturalWidth: 1024, complete: true });
+
+        await expect(getGeminiVisibleImageUrls(page)).resolves.toEqual([
+            'https://lh3.googleusercontent.com/generated.png',
+        ]);
+    });
 });
 
 describe('gemini image wait contract', () => {
@@ -110,6 +125,13 @@ describe('gemini image wait contract', () => {
         ]);
     });
 
+    it('unwraps Browser Bridge envelopes before reading the generation probe', async () => {
+        const page = wrapEvaluate(createPageMock({ generating: [true] }));
+        mountImage(page.dom, { src: 'https://lh3.googleusercontent.com/mid.png', naturalWidth: 1024, complete: true });
+
+        await expect(waitForGeminiImages(page, [], 9)).rejects.toThrow(/gemini image timed out/);
+    });
+
     it('resolves empty when generation finished without producing an image', async () => {
         const page = createPageMock({ generating: [false] });
 
@@ -120,6 +142,16 @@ describe('gemini image wait contract', () => {
 describe('gemini image export', () => {
     it('exports an image whose blob carries an image type', async () => {
         const page = createPageMock();
+        mountImage(page.dom, { src: 'blob:https://gemini.google.com/ok', naturalWidth: 1024, complete: true });
+        stubFetch(page.dom, { type: 'image/png' });
+
+        await expect(exportGeminiImages(page, ['blob:https://gemini.google.com/ok'])).resolves.toEqual([
+            expect.objectContaining({ dataUrl: PNG_DATA_URL, mimeType: 'image/png' }),
+        ]);
+    });
+
+    it('unwraps Browser Bridge envelopes before returning exported assets', async () => {
+        const page = wrapEvaluate(createPageMock());
         mountImage(page.dom, { src: 'blob:https://gemini.google.com/ok', naturalWidth: 1024, complete: true });
         stubFetch(page.dom, { type: 'image/png' });
 

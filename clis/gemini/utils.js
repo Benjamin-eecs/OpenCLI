@@ -2329,7 +2329,7 @@ export const __test__ = {
 };
 export async function getGeminiVisibleImageUrls(page) {
     await ensureGeminiPage(page);
-    return await page.evaluate(`
+    const result = await page.evaluate(`
     (() => {
       const isVisible = (el) => {
         if (!(el instanceof HTMLElement)) return false;
@@ -2362,10 +2362,13 @@ export async function getGeminiVisibleImageUrls(page) {
       return urls;
     })()
   `);
+    return requireGeminiArrayResult(result, 'Gemini image detection');
 }
 /** Cheap generation probe: the snapshot read walks the whole transcript. */
 export async function isGeminiGenerating(page) {
-    const value = await page.evaluate(`(() => ${isGeneratingExpression()})()`).catch(() => null);
+    const value = await page.evaluate(`(() => ${isGeneratingExpression()})()`)
+        .then((result) => unwrapGeminiEvaluateResult(result, 'Gemini generation probe'))
+        .catch(() => null);
     return typeof value === 'boolean' ? value : null;
 }
 export async function waitForGeminiImages(page, beforeUrls, timeoutSeconds) {
@@ -2408,7 +2411,7 @@ export async function waitForGeminiImages(page, beforeUrls, timeoutSeconds) {
 export async function exportGeminiImages(page, urls) {
     await ensureGeminiPage(page);
     const urlsJson = JSON.stringify(urls);
-    return await page.evaluate(`
+    const result = await page.evaluate(`
     (async (targetUrls) => {
       const blobToDataUrl = (blob) => new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -2477,6 +2480,7 @@ export async function exportGeminiImages(page, urls) {
       return results;
     })(${urlsJson})
   `);
+    return requireGeminiArrayResult(result, 'Gemini image export');
 }
 export async function waitForGeminiResponse(page, baseline, promptText, timeoutSeconds) {
     if (timeoutSeconds <= 0)
