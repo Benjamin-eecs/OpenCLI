@@ -135,6 +135,28 @@ cli({
     }
   });
 
+  it('warns when the same-basename js replacement is not loadable', async () => {
+    const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-broken-js-'));
+    const siteDir = path.join(tempRoot, 'broken-replacement-site');
+
+    try {
+      await fs.promises.mkdir(siteDir, { recursive: true });
+      await fs.promises.writeFile(path.join(siteDir, 'broken.yaml'), 'name: broken\ndescription: broken command\nbrowser: false\n');
+      await fs.promises.writeFile(path.join(siteDir, 'broken.js'), `
+import { cli } from '${pathToFileURL(path.join(process.cwd(), 'src', 'registry.ts')).href}';
+cli({
+`);
+
+      const { writes } = await captureStderr(() => discoverClis(tempRoot));
+
+      const warnings = writes.filter((line) => line.includes('YAML adapter'));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('broken.yaml');
+    } finally {
+      await fs.promises.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it('warns during valid-manifest fast path when yaml adapters are skipped', async () => {
     const tempBuildRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-manifest-'));
     const distDir = path.join(tempBuildRoot, 'dist');

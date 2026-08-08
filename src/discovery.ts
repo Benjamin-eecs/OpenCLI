@@ -29,6 +29,7 @@ export const PLUGINS_DIR = path.join(USER_OPENCLI_DIR, 'plugins');
 const PLUGIN_MODULE_PATTERN = /\b(?:cli|registerSiteAuthCommands|onStartup|onBeforeExecute|onAfterExecute)\s*\(/;
 const YAML_ADAPTER_EXT_RE = /\.ya?ml$/i;
 const warnedYamlAdapterPaths = new Set<string>();
+const cliModuleLoadResults = new Map<string, Promise<boolean>>();
 
 function parseStrategy(rawStrategy: string | undefined, fallback: Strategy = Strategy.COOKIE): Strategy {
   if (!rawStrategy) return fallback;
@@ -309,7 +310,7 @@ async function hasUsableJsReplacement(
 
   const jsPath = path.resolve(dir, jsFile);
   if (manifestFiles) return manifestFiles.has(jsPath);
-  return isCliModule(jsPath);
+  return loadCliModule(jsPath);
 }
 
 async function isLikelyYamlAdapter(filePath: string, pluginMode: boolean): Promise<boolean> {
@@ -345,6 +346,35 @@ async function stableWarningKey(filePath: string): Promise<string> {
   } catch {
     return path.resolve(filePath);
   }
+}
+
+async function cliModuleCacheKey(filePath: string): Promise<string> {
+  const resolved = await stableWarningKey(filePath);
+  try {
+    const stat = await fs.promises.stat(filePath);
+    return `${resolved}:${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    return resolved;
+  }
+}
+
+async function loadCliModule(filePath: string): Promise<boolean> {
+  const key = await cliModuleCacheKey(filePath);
+  let result = cliModuleLoadResults.get(key);
+  if (!result) {
+    result = (async () => {
+      if (!(await isCliModule(filePath))) return false;
+      try {
+        await import(pathToFileURL(filePath).href);
+        return true;
+      } catch (err) {
+        log.warn(`Failed to load module ${filePath}: ${getErrorMessage(err)}`);
+        return false;
+      }
+    })();
+    cliModuleLoadResults.set(key, result);
+  }
+  return result;
 }
 
 async function isCliModule(filePath: string): Promise<boolean> {
