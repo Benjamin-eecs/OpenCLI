@@ -10,6 +10,7 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process';
+import * as fs from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import * as path from 'node:path';
 import type { ElectronAppEntry } from './electron-apps.js';
@@ -116,26 +117,80 @@ export async function killProcess(processName: string): Promise<void> {
 
 /**
  * Discover the app installation path on macOS.
- * Uses osascript to resolve the app name to a POSIX path.
+ * Uses Launch Services/Spotlight metadata to resolve the app to a POSIX path.
  * Returns null if the app is not installed.
  */
-export function discoverAppPath(displayName: string): string | null {
-  if (process.platform !== 'darwin') {
-    return null;
-  }
+export function discoverAppPath(displayName: string, bundleId?: string): string | null {
+  return discoverAppPathForEntry({ displayName, bundleId });
+}
 
+function normalizeAppPath(appPath: string): string {
+  return appPath.trim().replace(/\/$/, '');
+}
+
+function appleScriptString(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function discoverAppPathByOsascript(nameOrBundleId: string, kind: 'name' | 'id'): string | null {
   try {
+    const appSpecifier = kind === 'id'
+      ? `id "${appleScriptString(nameOrBundleId)}"`
+      : `"${appleScriptString(nameOrBundleId)}"`;
     const result = execFileSync('osascript', [
-      '-e', `POSIX path of (path to application "${displayName}")`,
+      '-e', `POSIX path of (path to application ${appSpecifier})`,
     ], { encoding: 'utf-8', stdio: 'pipe', timeout: 5_000 });
-    return result.trim().replace(/\/$/, '');
+    const appPath = normalizeAppPath(result);
+    return appPath ? appPath : null;
   } catch {
     return null;
   }
 }
 
+function discoverAppPathByBundleId(bundleId: string): string | null {
+  if (!/^[A-Za-z0-9.-]+$/.test(bundleId)) return null;
+  try {
+    const result = execFileSync('mdfind', [
+      `kMDItemCFBundleIdentifier == "${bundleId}"`,
+    ], { encoding: 'utf-8', stdio: 'pipe', timeout: 5_000 });
+    const appPath = result
+      .split(/\r?\n/)
+      .map((line) => normalizeAppPath(line))
+      .find((line) => line.endsWith('.app'));
+    return appPath ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function discoverAppPathForEntry(app: Pick<ElectronAppEntry, 'displayName' | 'bundleId'> & { processName?: string }): string | null {
+  if (process.platform !== 'darwin') {
+    return null;
+  }
+
+  if (app.bundleId) {
+    const byBundleId = discoverAppPathByOsascript(app.bundleId, 'id') ?? discoverAppPathByBundleId(app.bundleId);
+    if (byBundleId) return byBundleId;
+  }
+
+  const label = app.displayName ?? app.processName;
+  return label ? discoverAppPathByOsascript(label, 'name') : null;
+}
+
 function resolveExecutable(appPath: string, processName: string): string {
   return `${appPath}/Contents/MacOS/${processName}`;
+}
+
+function resolveAppPathAliases(appPath: string): string[] {
+  const normalizedPath = normalizeAppPath(appPath);
+  const aliases = [normalizedPath];
+  try {
+    const realPath = normalizeAppPath(fs.realpathSync(normalizedPath));
+    if (realPath && !aliases.includes(realPath)) aliases.push(realPath);
+  } catch {
+    // If realpath is unavailable, the original app path is still the best evidence.
+  }
+  return aliases;
 }
 
 function isMissingExecutableError(err: unknown, label: string): boolean {
@@ -145,7 +200,14 @@ function isMissingExecutableError(err: unknown, label: string): boolean {
 
 export function resolveExecutableCandidates(appPath: string, app: ElectronAppEntry): string[] {
   const executableNames = app.executableNames?.length ? app.executableNames : [app.processName];
-  return [...new Set(executableNames)].map((name) => resolveExecutable(appPath, name));
+  const appPaths = resolveAppPathAliases(appPath);
+  const candidates = [];
+  for (const name of new Set(executableNames)) {
+    for (const candidateAppPath of appPaths) {
+      candidates.push(resolveExecutable(candidateAppPath, name));
+    }
+  }
+  return candidates;
 }
 
 export function findAppProcessPids(appPath: string, app: ElectronAppEntry): number[] {
@@ -325,7 +387,7 @@ export async function resolveElectronEndpoint(site: string): Promise<string> {
   }
 
   // Step 3: Discover path
-  const appPath = discoverAppPath(label);
+  const appPath = discoverAppPathForEntry(app);
   if (!appPath) {
     throw new CommandExecutionError(
       `Could not find ${label} on this machine.`,
