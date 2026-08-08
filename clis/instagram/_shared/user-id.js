@@ -8,13 +8,32 @@
  */
 export function buildResolveInstagramUserIdJs() {
     return `
+  function normalizeInstagramUserId(value, label) {
+    const id = typeof value === 'number' ? String(value) : (typeof value === 'string' ? value.trim() : '');
+    if (!/^\\d+$/.test(id)) throw new Error(label);
+    return id;
+  }
+  async function readInstagramJson(response, label) {
+    try {
+      return await response.json();
+    } catch {
+      throw new Error(label + ' returned invalid JSON');
+    }
+  }
+  function throwInstagramHttpError(response, label, username) {
+    if (response.status === 404) throw new Error('User not found: ' + username);
+    if (response.status === 401 || response.status === 403) {
+      throw new Error('HTTP ' + response.status + ' - make sure you are logged in to Instagram');
+    }
+    throw new Error(label + ' failed: HTTP ' + response.status);
+  }
   const r1 = await fetch('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(username), opts);
   if (r1.status === 404) throw new Error('User not found: ' + username);
-  let userId = r1.ok ? ((await r1.json())?.data?.user?.id || '') : '';
+  if (!r1.ok && r1.status !== 400) throwInstagramHttpError(r1, 'Instagram web_profile_info', username);
+  let userId = r1.ok ? normalizeInstagramUserId((await readInstagramJson(r1, 'Instagram web_profile_info'))?.data?.user?.id, 'Instagram web_profile_info returned no valid user id for: ' + username) : '';
   if (!userId) {
     const r1b = await fetch('https://www.instagram.com/api/v1/feed/user/' + encodeURIComponent(username) + '/username/?count=1', opts);
-    if (!r1b.ok) throw new Error(r1b.status === 404 ? 'User not found: ' + username : 'HTTP ' + r1b.status + ' - make sure you are logged in to Instagram');
-    userId = String((await r1b.json())?.user?.pk || '');
-    if (!userId) throw new Error('Instagram feed returned no profile owner for: ' + username);
+    if (!r1b.ok) throwInstagramHttpError(r1b, 'Instagram feed-by-username', username);
+    userId = normalizeInstagramUserId((await readInstagramJson(r1b, 'Instagram feed-by-username'))?.user?.pk, 'Instagram feed returned no valid profile owner for: ' + username);
   }`;
 }

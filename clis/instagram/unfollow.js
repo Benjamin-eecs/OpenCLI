@@ -31,6 +31,15 @@ cli({
     headers: { ...headers, 'X-CSRFToken': csrf, 'Content-Type': 'application/x-www-form-urlencoded' },
   });
   if (!r2.ok) throw new Error('Failed to unfollow: HTTP ' + r2.status);
+  let d2;
+  try {
+    d2 = await r2.json();
+  } catch {
+    throw new Error('Instagram unfollow returned invalid JSON');
+  }
+  if (!d2 || typeof d2 !== 'object' || d2.status !== 'ok') {
+    throw new Error('Instagram unfollow returned no success evidence');
+  }
   return [{ status: 'Unfollowed', username }];
 })()
 ` },

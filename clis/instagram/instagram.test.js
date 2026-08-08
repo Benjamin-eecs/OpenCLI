@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import './follow.js';
+import './followers.js';
 import './following.js';
 import './profile.js';
+import './save.js';
+import './unfollow.js';
 import { getRegistry } from '@jackwener/opencli/registry';
 
 /**
@@ -413,7 +416,7 @@ describe('instagram business-account endpoint fallback', () => {
             .mockResolvedValueOnce(feedResponse)
             .mockResolvedValueOnce({
                 ok: true,
-                json: () => Promise.resolve({ friendship_status: { following: true } }),
+                json: () => Promise.resolve({ status: 'ok', friendship_status: { following: true } }),
             });
 
         const result = await runCommandEvaluate('follow', fetchFn, {
@@ -434,6 +437,24 @@ describe('instagram business-account endpoint fallback', () => {
         expect(fetchFn).toHaveBeenCalledTimes(1);
     });
 
+    it('follow does not treat auth failures as business-account fallback', async () => {
+        const fetchFn = vi.fn().mockResolvedValueOnce({ ok: false, status: 401 });
+
+        await expect(runCommandEvaluate('follow', fetchFn, {
+            '${{ args.username | json }}': JSON.stringify('privateuser'),
+        })).rejects.toThrow('HTTP 401 - make sure you are logged in to Instagram');
+        expect(fetchFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('follow does not hide web_profile_info server failures behind the fallback', async () => {
+        const fetchFn = vi.fn().mockResolvedValueOnce({ ok: false, status: 503 });
+
+        await expect(runCommandEvaluate('follow', fetchFn, {
+            '${{ args.username | json }}': JSON.stringify('flakyuser'),
+        })).rejects.toThrow('Instagram web_profile_info failed: HTTP 503');
+        expect(fetchFn).toHaveBeenCalledTimes(1);
+    });
+
     it('follow reports feed drift instead of a missing user when the owner id is absent', async () => {
         const fetchFn = vi.fn()
             .mockResolvedValueOnce(gatedResponse)
@@ -441,7 +462,46 @@ describe('instagram business-account endpoint fallback', () => {
 
         await expect(runCommandEvaluate('follow', fetchFn, {
             '${{ args.username | json }}': JSON.stringify('bizaccount'),
-        })).rejects.toThrow('Instagram feed returned no profile owner for: bizaccount');
+        })).rejects.toThrow('Instagram feed returned no valid profile owner for: bizaccount');
+    });
+
+    it('follow rejects non-numeric feed owner ids instead of constructing a friendship URL', async () => {
+        const fetchFn = vi.fn()
+            .mockResolvedValueOnce(gatedResponse)
+            .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ user: { pk: { bad: true } } }) });
+
+        await expect(runCommandEvaluate('follow', fetchFn, {
+            '${{ args.username | json }}': JSON.stringify('bizaccount'),
+        })).rejects.toThrow('Instagram feed returned no valid profile owner for: bizaccount');
+        expect(fetchFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('follow requires explicit friendship success evidence from the POST response', async () => {
+        const fetchFn = vi.fn()
+            .mockResolvedValueOnce(gatedResponse)
+            .mockResolvedValueOnce(feedResponse)
+            .mockResolvedValueOnce({
+                ok: true,
+                json: () => Promise.resolve({ status: 'ok', friendship_status: { following: false, outgoing_request: false } }),
+            });
+
+        await expect(runCommandEvaluate('follow', fetchFn, {
+            '${{ args.username | json }}': JSON.stringify('bizaccount'),
+        })).rejects.toThrow('Instagram follow returned no success evidence');
+    });
+
+    it('unfollow requires a parseable ok response from the POST', async () => {
+        const fetchFn = vi.fn()
+            .mockResolvedValueOnce(gatedResponse)
+            .mockResolvedValueOnce(feedResponse)
+            .mockResolvedValueOnce({
+                ok: true,
+                json: () => Promise.resolve({ status: 'fail' }),
+            });
+
+        await expect(runCommandEvaluate('unfollow', fetchFn, {
+            '${{ args.username | json }}': JSON.stringify('bizaccount'),
+        })).rejects.toThrow('Instagram unfollow returned no success evidence');
     });
 
     it('profile falls back to users info and maps the mobile field names', async () => {
@@ -475,7 +535,6 @@ describe('instagram business-account endpoint fallback', () => {
             following: 510,
             posts: 1493,
             verified: 'Yes',
-            url: 'https://www.instagram.com/bizaccount',
         }]);
         expect(fetchFn.mock.calls[2][0]).toContain('/api/v1/users/4213518589/info/');
     });
@@ -522,5 +581,51 @@ describe('instagram business-account endpoint fallback', () => {
 
         expect(result).toHaveLength(1);
         expect(fetchFn.mock.calls[2][0]).toContain('/api/v1/friendships/4213518589/following/');
+    });
+
+    it('followers rejects malformed user rows instead of emitting blank usernames', async () => {
+        const fetchFn = vi.fn()
+            .mockResolvedValueOnce(gatedResponse)
+            .mockResolvedValueOnce(feedResponse)
+            .mockResolvedValueOnce({
+                ok: true,
+                json: () => Promise.resolve({ users: [{ pk: { bad: true }, username: 'bad' }] }),
+            });
+
+        await expect(runCommandEvaluate('followers', fetchFn, {
+            '${{ args.username | json }}': JSON.stringify('bizaccount'),
+            '${{ args.limit }}': '5',
+        })).rejects.toThrow('Instagram followers returned malformed user row');
+    });
+
+    it('save typed-fails malformed feed item payloads before POSTing', async () => {
+        const fetchFn = vi.fn()
+            .mockResolvedValueOnce({
+                ok: true,
+                json: () => Promise.resolve({ user: { pk: '4213518589' }, items: [{ caption: { text: 'missing pk' } }] }),
+            });
+
+        await expect(runCommandEvaluate('save', fetchFn, {
+            '${{ args.username | json }}': JSON.stringify('bizaccount'),
+            '${{ args.index }}': '1',
+        })).rejects.toThrow('Instagram feed-by-username returned malformed post row');
+        expect(fetchFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('save requires ok status from the POST response', async () => {
+        const fetchFn = vi.fn()
+            .mockResolvedValueOnce({
+                ok: true,
+                json: () => Promise.resolve({ user: { pk: '4213518589' }, items: [{ pk: '98765', caption: { text: 'post' } }] }),
+            })
+            .mockResolvedValueOnce({
+                ok: true,
+                json: () => Promise.resolve({ status: 'fail' }),
+            });
+
+        await expect(runCommandEvaluate('save', fetchFn, {
+            '${{ args.username | json }}': JSON.stringify('bizaccount'),
+            '${{ args.index }}': '1',
+        })).rejects.toThrow('Instagram save returned no success evidence');
     });
 });

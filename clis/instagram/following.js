@@ -44,9 +44,10 @@ cli({
       if (!u || typeof u !== 'object') {
         throw new Error('Instagram following returned malformed user row');
       }
-      const pk = String(u.pk ?? u.pk_id ?? u.id ?? '');
+      const pkRaw = u.pk ?? u.pk_id ?? u.id;
+      const pk = typeof pkRaw === 'number' ? String(pkRaw) : (typeof pkRaw === 'string' ? pkRaw.trim() : '');
       const usernameValue = typeof u.username === 'string' ? u.username.trim() : '';
-      if (!pk || !usernameValue) {
+      if (!/^\\d+$/.test(pk) || !usernameValue) {
         throw new Error('Instagram following returned malformed user row');
       }
       if (!pk || seen.has(pk)) continue;
