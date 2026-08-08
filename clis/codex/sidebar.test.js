@@ -386,6 +386,14 @@ describe('codex sidebar commands', () => {
         await expect(extractDiffCommand.func(page)).rejects.toBeInstanceOf(EmptyResultError);
     });
 
+    it('extract-diff unwraps Browser Bridge envelopes before checking empty results', async () => {
+        const page = {
+            evaluate: async () => ({ session: 'codex', data: [] }),
+        };
+
+        await expect(extractDiffCommand.func(page)).rejects.toBeInstanceOf(EmptyResultError);
+    });
+
     it('ask rejects invalid timeout instead of falling back to the default', async () => {
         const page = {
             evaluate: async () => 0,
@@ -494,6 +502,18 @@ describe('codex send picker', () => {
         };
 
         await expect(sendCommand.func(page, { text: 'hello' })).rejects.toMatchObject({ code: 'SELECTOR' });
+    });
+
+    it('send unwraps Browser Bridge envelopes before trusting injection success', async () => {
+        const pressed = [];
+        const page = {
+            evaluate: async () => ({ session: 'codex', data: false }),
+            wait: async () => {},
+            pressKey: async (key) => { pressed.push(key); },
+        };
+
+        await expect(sendCommand.func(page, { text: 'hello' })).rejects.toMatchObject({ code: 'SELECTOR' });
+        expect(pressed).toEqual([]);
     });
 
     it('send submits plain text with a single Enter when no picker appears', async () => {

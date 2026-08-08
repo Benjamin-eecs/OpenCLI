@@ -118,7 +118,7 @@ export const sendCommand = cli({
             throw new ArgumentError('--pick label cannot be empty');
         }
         const selected = await openCodexConversation(page, kwargs);
-        const injected = await page.evaluate(`
+        const injected = unwrapEvaluateResult(await page.evaluate(`
       (function(text) {
         const composer = (${findCodexComposerElement.toString()})();
         if (!composer) return false;
@@ -127,7 +127,7 @@ export const sendCommand = cli({
         document.execCommand('insertText', false, text);
         return true;
       })(${JSON.stringify(textToInsert)})
-    `);
+    `));
         if (!injected)
             throw selectorError('Codex Composer input element');
         // Wait for the UI to register the input
