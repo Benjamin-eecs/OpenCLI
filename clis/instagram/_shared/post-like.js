@@ -154,6 +154,23 @@ function pickPost(snapshot, username, index, command) {
     return post;
 }
 
+async function confirmPersistedState(page, username, index, command, expectedPost, shouldLike) {
+    const confirmed = pickPost(await readPostSnapshot(page, username, index, command), username, index, command);
+    if (confirmed.code !== expectedPost.code || confirmed.pk !== expectedPost.pk) {
+        throw new CommandExecutionError(
+            `Instagram post feed no longer shows the expected post ${expectedPost.code} at index ${index}`,
+            'The profile feed may have re-rendered or changed order; retry after checking the post in the browser.',
+        );
+    }
+    if (confirmed.liked !== shouldLike) {
+        throw new CommandExecutionError(
+            `Instagram did not persist the ${shouldLike ? 'like' : 'unlike'} on ${expectedPost.code}`,
+            'The action may have been rejected. Retry later, or check the post in the browser.',
+        );
+    }
+    return confirmed;
+}
+
 export async function setInstagramPostLike(page, kwargs, shouldLike) {
     const username = String(kwargs.username || '').trim();
     const index = kwargs.index;
@@ -183,7 +200,10 @@ export async function setInstagramPostLike(page, kwargs, shouldLike) {
             'Open the post in the browser and check whether Instagram is asking you to log in, or set the interface language to English.',
         );
     }
-    if (click.already) return settled;
+    if (click.already) {
+        await confirmPersistedState(page, username, index, command, post, shouldLike);
+        return settled;
+    }
 
     for (let attempt = 0; attempt < 5; attempt += 1) {
         await page.sleep(1);
@@ -191,19 +211,7 @@ export async function setInstagramPostLike(page, kwargs, shouldLike) {
         // A rejected action reverts the icon shortly after the optimistic flip.
         await page.sleep(2);
         if (unwrapEvaluateResult(await page.evaluate(buildReadLikeStateJs(shouldLike))) === true) {
-            const confirmed = pickPost(await readPostSnapshot(page, username, index, command), username, index, command);
-            if (confirmed.code !== post.code || confirmed.pk !== post.pk) {
-                throw new CommandExecutionError(
-                    `Instagram post feed no longer shows the expected post ${post.code} at index ${index}`,
-                    'The profile feed may have re-rendered or changed order; retry after checking the post in the browser.',
-                );
-            }
-            if (confirmed.liked !== shouldLike) {
-                throw new CommandExecutionError(
-                    `Instagram did not persist the ${shouldLike ? 'like' : 'unlike'} on ${post.code}`,
-                    'The action may have been rejected. Retry later, or check the post in the browser.',
-                );
-            }
+            await confirmPersistedState(page, username, index, command, post, shouldLike);
             return [{ status: shouldLike ? 'Liked' : 'Unliked', user: username, post: label }];
         }
         break;

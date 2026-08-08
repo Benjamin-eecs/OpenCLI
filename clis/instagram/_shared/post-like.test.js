@@ -200,6 +200,32 @@ describe('instagram post like', () => {
         expect(page.goto).not.toHaveBeenCalled();
     });
 
+    it('requires feed confirmation when the post page already shows the target state', async () => {
+        const dom = createPostDom({ actionBarLabel: 'Unlike', commentLabel: 'Like' });
+        let reads = 0;
+        const page = createPageMock({
+            feed: () => {
+                reads += 1;
+                return reads === 1
+                    ? onePost
+                    : { ownerId: '42', items: [{ code: 'ABC123', pk: '98765', caption: 'a caption', liked: true }] };
+            },
+            dom,
+        });
+
+        await expect(setInstagramPostLike(page, args, true)).resolves.toEqual([
+            { status: 'Already liked', user: 'someone', post: 'a caption' },
+        ]);
+        expect(page.evaluate.mock.calls.filter(([script]) => script.includes('/username/?count='))).toHaveLength(2);
+    });
+
+    it('typed-fails when an already-state DOM control is not confirmed by the feed', async () => {
+        const dom = createPostDom({ actionBarLabel: 'Unlike', commentLabel: 'Like' });
+        const page = createPageMock({ feed: onePost, dom });
+
+        await expect(setInstagramPostLike(page, args, true)).rejects.toThrow('Instagram did not persist the like on ABC123');
+    });
+
     it('unlikes through the same control and reports the reverse status', async () => {
         const dom = createPostDom({ actionBarLabel: 'Unlike', commentLabel: 'Unlike' });
         let feed = { ownerId: '42', items: [{ code: 'ABC123', pk: '98765', caption: 'a caption', liked: true }] };
