@@ -7,10 +7,17 @@ import { httpDownload } from '@jackwener/opencli/download';
 const INSTAGRAM_APP_ID = '936619743392459';
 const INSTAGRAM_HOST_SUFFIX = 'instagram.com';
 const INSTAGRAM_SHORTCODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+const MAX_INSTAGRAM_MEDIA_ID = 9223372036854775807n;
 const SUPPORTED_KINDS = new Set(['p', 'reel', 'tv']);
 function displayPath(filePath) {
     const home = os.homedir();
     return filePath.startsWith(home) ? `~${filePath.slice(home.length)}` : filePath;
+}
+function unwrapEvaluateResult(result) {
+    if (result && typeof result === 'object' && !Array.isArray(result) && 'session' in result && 'data' in result) {
+        return result.data;
+    }
+    return result;
 }
 export function resolveOutputDir(value) {
     const raw = String(value || '').trim();
@@ -28,7 +35,9 @@ export function shortcodeToMediaId(shortcode) {
         const digit = INSTAGRAM_SHORTCODE_ALPHABET.indexOf(character);
         if (digit < 0) return '';
         mediaId = mediaId * 64n + BigInt(digit);
+        if (mediaId > MAX_INSTAGRAM_MEDIA_ID) return '';
     }
+    if (mediaId <= 0n) return '';
     return mediaId.toString();
 }
 export function parseInstagramMediaTarget(input) {
@@ -74,23 +83,31 @@ export function parseInstagramMediaTarget(input) {
     };
 }
 export function buildInstagramDownloadItems(shortcode, items) {
-    return items
-        .filter((item) => item?.url)
-        .map((item, index) => {
-        const fallbackExt = item.type === 'video' ? '.mp4' : '.jpg';
-        let ext = fallbackExt;
+    if (!Array.isArray(items)) {
+        throw new CommandExecutionError('Instagram media metadata returned a malformed media list');
+    }
+    return items.map((item, index) => {
+        if (!item || typeof item !== 'object' || !['image', 'video'].includes(item.type)) {
+            throw new CommandExecutionError(`Instagram media metadata returned malformed media item #${index + 1}`);
+        }
+        let downloadUrl;
         try {
-            const pathname = new URL(item.url).pathname;
-            const candidateExt = path.extname(pathname).toLowerCase();
-            if (candidateExt && candidateExt.length <= 8)
-                ext = candidateExt;
+            downloadUrl = new URL(String(item.url || ''));
         }
         catch {
-            ext = fallbackExt;
+            throw new CommandExecutionError(`Instagram media metadata returned an invalid download URL for item #${index + 1}`);
         }
+        if (!['http:', 'https:'].includes(downloadUrl.protocol)) {
+            throw new CommandExecutionError(`Instagram media metadata returned an unsupported download URL for item #${index + 1}`);
+        }
+        const fallbackExt = item.type === 'video' ? '.mp4' : '.jpg';
+        let ext = fallbackExt;
+        const candidateExt = path.extname(downloadUrl.pathname).toLowerCase();
+        if (candidateExt && candidateExt.length <= 8)
+            ext = candidateExt;
         return {
             type: item.type,
-            url: item.url,
+            url: downloadUrl.toString(),
             filename: `${shortcode}_${String(index + 1).padStart(2, '0')}${ext}`,
         };
     });
@@ -104,13 +121,22 @@ export function buildInstagramFetchScript(shortcode) {
       const shortcode = ${JSON.stringify(shortcode)};
       const mediaId = ${JSON.stringify(shortcodeToMediaId(shortcode))};
       const url = 'https://www.instagram.com/api/v1/media/' + mediaId + '/info/';
-      const res = await fetch(url, {
-        credentials: 'include',
-        headers: {
-          'Accept': 'application/json,text/plain,*/*',
-          'X-IG-App-ID': ${JSON.stringify(INSTAGRAM_APP_ID)},
-        },
-      });
+      let res = null;
+      try {
+        res = await fetch(url, {
+          credentials: 'include',
+          headers: {
+            'Accept': 'application/json,text/plain,*/*',
+            'X-IG-App-ID': ${JSON.stringify(INSTAGRAM_APP_ID)},
+          },
+        });
+      } catch (err) {
+        return {
+          ok: false,
+          errorCode: 'COMMAND_EXEC',
+          error: 'Instagram media info request failed: ' + (err && err.message ? err.message : String(err || 'fetch failed')),
+        };
+      }
       const rawText = await res.text();
 
       let data = null;
@@ -123,9 +149,28 @@ export function buildInstagramFetchScript(shortcode) {
           error: 'Instagram returned non-JSON content while fetching media metadata',
         };
       }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return {
+          ok: false,
+          errorCode: 'COMMAND_EXEC',
+          error: 'Instagram returned malformed media metadata',
+        };
+      }
 
       const message = typeof data?.message === 'string' ? data.message : '';
       const lowered = (message || '').toLowerCase();
+      const classifyInBandFailure = () => {
+        if (data?.require_login || lowered.includes('login') || lowered.includes('auth')) {
+          return { ok: false, errorCode: 'AUTH_REQUIRED', error: message || 'Instagram login required' };
+        }
+        if (lowered.includes('wait a few minutes') || lowered.includes('rate')) {
+          return { ok: false, errorCode: 'RATE_LIMITED', error: message || 'Instagram rate limit triggered' };
+        }
+        if (lowered.includes('not found') || lowered.includes('unavailable') || lowered.includes('private')) {
+          return { ok: false, errorCode: 'PRIVATE_OR_UNAVAILABLE', error: message || 'Post may be private or unavailable' };
+        }
+        return { ok: false, errorCode: 'COMMAND_EXEC', error: message || 'Instagram returned a failed media metadata status' };
+      };
 
       if (!res.ok) {
         if (res.status === 401 || res.status === 403 || data?.require_login) {
@@ -146,34 +191,102 @@ export function buildInstagramFetchScript(shortcode) {
       if (lowered.includes('wait a few minutes') || lowered.includes('rate')) {
         return { ok: false, errorCode: 'RATE_LIMITED', error: message || 'Instagram rate limit triggered' };
       }
+      if (typeof data?.status === 'string' && data.status !== 'ok') {
+        return classifyInBandFailure();
+      }
 
-      const media = Array.isArray(data?.items) ? data.items[0] : null;
-      if (!media) {
+      if (!Array.isArray(data?.items)) {
+        return {
+          ok: false,
+          errorCode: 'COMMAND_EXEC',
+          error: 'Instagram media metadata returned malformed items',
+        };
+      }
+      if (data.items.length === 0) {
         return {
           ok: false,
           errorCode: 'PRIVATE_OR_UNAVAILABLE',
           error: message || 'Post may be private, unavailable, or inaccessible to the current browser session',
         };
       }
+      const media = data.items[0];
+      if (!media || typeof media !== 'object' || Array.isArray(media)) {
+        return {
+          ok: false,
+          errorCode: 'COMMAND_EXEC',
+          error: 'Instagram media metadata returned malformed media item',
+        };
+      }
+      if (media.code !== shortcode) {
+        return {
+          ok: false,
+          errorCode: 'COMMAND_EXEC',
+          error: 'Instagram media info returned metadata for a different shortcode',
+        };
+      }
 
-      const nodes = Array.isArray(media?.carousel_media) && media.carousel_media.length > 0
-        ? media.carousel_media
-        : [media];
+      const widest = (candidates, label) => {
+        if (!Array.isArray(candidates) || candidates.length === 0) {
+          return { ok: false, error: 'Instagram media metadata is missing ' + label };
+        }
+        let best = null;
+        for (const candidate of candidates) {
+          if (!candidate || typeof candidate !== 'object' || typeof candidate.url !== 'string' || !candidate.url) continue;
+          const width = Number(candidate.width) || 0;
+          if (!best || width > best.width) best = { width, url: candidate.url };
+        }
+        if (!best) {
+          return { ok: false, error: 'Instagram media metadata has no usable ' + label };
+        }
+        return { ok: true, url: best.url };
+      };
+      const pickNode = (node, index) => {
+        if (!node || typeof node !== 'object' || Array.isArray(node)) {
+          return { ok: false, error: 'Instagram media metadata returned malformed carousel item #' + (index + 1) };
+        }
+        if (node.media_type === 1) {
+          const picked = widest(node?.image_versions2?.candidates, 'image candidates for item #' + (index + 1));
+          return picked.ok ? { ok: true, item: { type: 'image', url: picked.url } } : picked;
+        }
+        if (node.media_type === 2) {
+          const picked = widest(node?.video_versions, 'video renditions for item #' + (index + 1));
+          return picked.ok ? { ok: true, item: { type: 'video', url: picked.url } } : picked;
+        }
+        return { ok: false, error: 'Instagram media metadata returned unsupported media_type for item #' + (index + 1) };
+      };
 
-      // Candidate order is not guaranteed, so pick the widest rather than the
-      // first, and keep the declared media_type: a video whose renditions are
-      // missing must yield no url instead of falling back to its cover image.
-      const widest = (candidates) => (Array.isArray(candidates) ? candidates : [])
-        .reduce((best, candidate) => !best || (Number(candidate?.width) || 0) > (Number(best?.width) || 0) ? candidate : best, null);
-      const pickUrl = (node) => node?.media_type === 2
-        ? { type: 'video', url: String(widest(node?.video_versions)?.url || '') }
-        : { type: 'image', url: String(widest(node?.image_versions2?.candidates)?.url || '') };
+      let nodes = null;
+      if (media.media_type === 8) {
+        if (!Array.isArray(media.carousel_media) || media.carousel_media.length === 0) {
+          return {
+            ok: false,
+            errorCode: 'COMMAND_EXEC',
+            error: 'Instagram carousel metadata returned no media items',
+          };
+        }
+        nodes = media.carousel_media;
+      } else if (media.media_type === 1 || media.media_type === 2) {
+        nodes = [media];
+      } else {
+        return {
+          ok: false,
+          errorCode: 'COMMAND_EXEC',
+          error: 'Instagram media metadata returned unsupported media_type',
+        };
+      }
 
-      const items = nodes.map(pickUrl).filter((item) => item.url);
+      const items = [];
+      for (let index = 0; index < nodes.length; index += 1) {
+        const picked = pickNode(nodes[index], index);
+        if (!picked.ok) {
+          return { ok: false, errorCode: 'COMMAND_EXEC', error: picked.error };
+        }
+        items.push(picked.item);
+      }
 
       return {
         ok: true,
-        shortcode: media.code || shortcode,
+        shortcode: media.code,
         owner: media?.user?.username || '',
         items,
       };
@@ -186,10 +299,14 @@ function ensurePage(page) {
     return page;
 }
 function normalizeFetchResult(result) {
-    if (!result || typeof result !== 'object') {
+    const unwrapped = unwrapEvaluateResult(result);
+    if (!unwrapped || typeof unwrapped !== 'object' || Array.isArray(unwrapped)) {
         throw new CommandExecutionError('Failed to fetch Instagram media metadata');
     }
-    return result;
+    if (typeof unwrapped.ok !== 'boolean') {
+        throw new CommandExecutionError('Instagram media metadata returned malformed result');
+    }
+    return unwrapped;
 }
 function handleFetchFailure(result) {
     const message = result.error || 'Instagram media fetch failed';
@@ -213,6 +330,9 @@ async function downloadInstagramMedia(items, outputDir) {
         });
         if (!result.success) {
             throw new CommandExecutionError(`Failed to download ${item.filename}: ${result.error || 'unknown error'}`);
+        }
+        if (!Number.isFinite(result.size) || result.size <= 0) {
+            throw new CommandExecutionError(`Failed to verify downloaded bytes for ${item.filename}`);
         }
     }
 }

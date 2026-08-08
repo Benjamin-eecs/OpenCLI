@@ -48,17 +48,25 @@ describe('instagram download helpers', () => {
         expect(buildInstagramDownloadItems('DWUR_azCWbN', [
             { type: 'image', url: 'https://cdn.example.com/photo.webp?foo=1' },
             { type: 'video', url: 'https://cdn.example.com/video.mp4?bar=2' },
-            { type: 'image', url: 'not-a-valid-url' },
         ])).toEqual([
             { type: 'image', url: 'https://cdn.example.com/photo.webp?foo=1', filename: 'DWUR_azCWbN_01.webp' },
             { type: 'video', url: 'https://cdn.example.com/video.mp4?bar=2', filename: 'DWUR_azCWbN_02.mp4' },
-            { type: 'image', url: 'not-a-valid-url', filename: 'DWUR_azCWbN_03.jpg' },
         ]);
+    });
+    it('typed-fails malformed download items instead of passing them to the downloader', () => {
+        expect(() => buildInstagramDownloadItems('DWUR_azCWbN', [{ type: 'image', url: 'not-a-valid-url' }]))
+            .toThrow('invalid download URL');
+        expect(() => buildInstagramDownloadItems('DWUR_azCWbN', [{ type: 'image', url: 'file:///tmp/photo.jpg' }]))
+            .toThrow('unsupported download URL');
+        expect(() => buildInstagramDownloadItems('DWUR_azCWbN', [{ type: 'cover', url: 'https://cdn.example.com/photo.jpg' }]))
+            .toThrow('malformed media item');
     });
     it('decodes a shortcode into the media id the info endpoint takes', () => {
         expect(shortcodeToMediaId('DbnndRYRLRm')).toBe('3956304333007795302');
         expect(shortcodeToMediaId('')).toBe('');
         expect(shortcodeToMediaId('not a shortcode')).toBe('');
+        expect(shortcodeToMediaId('A')).toBe('');
+        expect(shortcodeToMediaId('___________')).toBe('');
     });
     it('requests the media info endpoint instead of a persisted query', () => {
         const script = buildInstagramFetchScript('DbnndRYRLRm');
@@ -77,7 +85,7 @@ describe('instagram download helpers', () => {
         await expect(read({
             items: [
                 {
-                    code: 'DifferentCode',
+                    code: 'DbnndRYRLRm',
                     media_type: 2,
                     user: { username: 'instagram' },
                     video_versions: [{ url: 'https://cdn.example.com/small.mp4', width: 480 }, { url: 'https://cdn.example.com/full.mp4', width: 1080 }],
@@ -87,7 +95,7 @@ describe('instagram download helpers', () => {
             ],
         })).resolves.toEqual({
             ok: true,
-            shortcode: 'DifferentCode',
+            shortcode: 'DbnndRYRLRm',
             owner: 'instagram',
             items: [{ type: 'video', url: 'https://cdn.example.com/full.mp4' }],
         });
@@ -111,7 +119,7 @@ describe('instagram download helpers', () => {
             ],
         });
     });
-    it('reports no media rather than a cover image when a video carries no renditions', async () => {
+    it('typed-fails instead of using a cover image when a video carries no renditions', async () => {
         const read = (payload) => new Function(`return (async () => {
       const fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(${JSON.stringify(JSON.stringify(payload))}) });
       return await ${buildInstagramFetchScript('DbnndRYRLRm')};
@@ -124,9 +132,32 @@ describe('instagram download helpers', () => {
                 video_versions: [],
                 image_versions2: { candidates: [{ url: 'https://cdn.example.com/cover.jpg', width: 1080 }] },
             }],
-        })).resolves.toMatchObject({ ok: true, items: [] });
+        })).resolves.toMatchObject({ ok: false, errorCode: 'COMMAND_EXEC', error: expect.stringContaining('video renditions') });
 
         await expect(read({ items: [] })).resolves.toMatchObject({ ok: false, errorCode: 'PRIVATE_OR_UNAVAILABLE' });
+    });
+    it('typed-fails malformed media info payloads and wrong shortcode identity', async () => {
+        const read = (payload) => new Function(`return (async () => {
+      const fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(${JSON.stringify(JSON.stringify(payload))}) });
+      return await ${buildInstagramFetchScript('DbnndRYRLRm')};
+    })()`)();
+
+        await expect(read({ status: 'ok' })).resolves.toMatchObject({ ok: false, errorCode: 'COMMAND_EXEC', error: expect.stringContaining('malformed items') });
+        await expect(read({ status: 'fail', message: 'temporary parser drift' })).resolves.toMatchObject({ ok: false, errorCode: 'COMMAND_EXEC' });
+        await expect(read({ items: [{ code: 'DifferentCode', media_type: 1, image_versions2: { candidates: [{ url: 'https://cdn.example.com/photo.jpg', width: 1 }] } }] }))
+            .resolves.toMatchObject({ ok: false, errorCode: 'COMMAND_EXEC', error: expect.stringContaining('different shortcode') });
+        await expect(read({ items: [{ code: 'DbnndRYRLRm', media_type: 8, carousel_media: [] }] }))
+            .resolves.toMatchObject({ ok: false, errorCode: 'COMMAND_EXEC', error: expect.stringContaining('carousel metadata returned no media items') });
+        await expect(read({ items: [{ code: 'DbnndRYRLRm', media_type: 8, carousel_media: [{ media_type: 1, image_versions2: { candidates: [{ url: 'https://cdn.example.com/one.jpg', width: 1 }] } }, { media_type: 2, video_versions: [] }] }] }))
+            .resolves.toMatchObject({ ok: false, errorCode: 'COMMAND_EXEC', error: expect.stringContaining('video renditions') });
+    });
+    it('normalizes fetch failures into typed command errors', async () => {
+        const read = () => new Function(`return (async () => {
+      const fetch = () => Promise.reject(new Error('network down'));
+      return await ${buildInstagramFetchScript('DbnndRYRLRm')};
+    })()`)();
+
+        await expect(read()).resolves.toMatchObject({ ok: false, errorCode: 'COMMAND_EXEC', error: expect.stringContaining('network down') });
     });
     it('treats a status:fail error body as private or unavailable', async () => {
         const read = (payload) => new Function(`return (async () => {
@@ -138,6 +169,7 @@ describe('instagram download helpers', () => {
     });
     it('rejects a shortcode that is not in the media id alphabet', () => {
         expect(() => parseInstagramMediaTarget('https://www.instagram.com/p/DWUR%5FazCWbN/')).toThrow(ArgumentError);
+        expect(() => parseInstagramMediaTarget('https://www.instagram.com/p/___________/')).toThrow(ArgumentError);
     });
     it('expands a leading ~ in the download path', () => {
         expect(resolveOutputDir('~/Downloads/Instagram')).toBe(path.join(os.homedir(), 'Downloads', 'Instagram'));
@@ -149,6 +181,7 @@ describe('instagram download helpers', () => {
 describe('instagram download command', () => {
     beforeEach(() => {
         mockHttpDownload.mockReset();
+        mockMkdirSync.mockClear();
         logSpy.mockClear();
     });
     it('rejects invalid URLs before browser work', async () => {
@@ -175,6 +208,32 @@ describe('instagram download command', () => {
         const page = createPageMock({ ok: true, shortcode: 'DWUR_azCWbN', items: [] });
         await expect(cmd.func(page, { url: 'https://www.instagram.com/p/DWUR_azCWbN/' })).rejects.toThrow(CommandExecutionError);
         expect(mockHttpDownload).not.toHaveBeenCalled();
+    });
+    it('unwraps Browser Bridge envelopes before validating metadata', async () => {
+        mockHttpDownload.mockResolvedValueOnce({ success: true, size: 120_000 });
+        const page = createPageMock({
+            session: 'site:instagram',
+            data: {
+                ok: true,
+                shortcode: 'DWUR_azCWbN',
+                items: [{ type: 'image', url: 'https://cdn.example.com/photo.webp?foo=1' }],
+            },
+        });
+
+        await expect(cmd.func(page, { url: 'https://www.instagram.com/p/DWUR_azCWbN/', path: './instagram-test' })).resolves.toBeNull();
+        expect(mockHttpDownload).toHaveBeenCalledTimes(1);
+    });
+    it('typed-fails malformed Browser Bridge envelopes and zero-byte downloads', async () => {
+        await expect(cmd.func(createPageMock({ session: 'site:instagram' }), { url: 'https://www.instagram.com/p/DWUR_azCWbN/' }))
+            .rejects.toThrow('malformed result');
+
+        mockHttpDownload.mockResolvedValueOnce({ success: true, size: 0 });
+        await expect(cmd.func(createPageMock({
+            ok: true,
+            shortcode: 'DWUR_azCWbN',
+            items: [{ type: 'image', url: 'https://cdn.example.com/photo.webp?foo=1' }],
+        }), { url: 'https://www.instagram.com/p/DWUR_azCWbN/' }))
+            .rejects.toThrow('Failed to verify downloaded bytes');
     });
     it('downloads media and prints saved directory', async () => {
         mockHttpDownload
