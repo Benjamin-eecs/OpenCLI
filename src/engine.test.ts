@@ -8,6 +8,19 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+async function captureStderr<T>(fn: () => Promise<T>): Promise<{ result: T; writes: string[] }> {
+  const writes: string[] = [];
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+    writes.push(String(chunk));
+    return true;
+  });
+  try {
+    return { result: await fn(), writes };
+  } finally {
+    stderr.mockRestore();
+  }
+}
+
 describe('discoverClis', () => {
   it('handles non-existent directories gracefully', async () => {
     // Should not throw for missing directories
@@ -52,26 +65,21 @@ cli({
   it('warns once per site directory that holds skipped yaml adapters', async () => {
     const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-skip-'));
     const siteDir = path.join(tempRoot, 'yaml-site');
-    const writes: string[] = [];
-    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-      writes.push(String(chunk));
-      return true;
-    });
 
     try {
       await fs.promises.mkdir(siteDir, { recursive: true });
-      await fs.promises.writeFile(path.join(siteDir, 'one.yaml'), 'name: one\n');
-      await fs.promises.writeFile(path.join(siteDir, 'two.yml'), 'name: two\n');
+      await fs.promises.writeFile(path.join(siteDir, 'one.yaml'), 'name: one\ndescription: one command\nbrowser: false\n');
+      await fs.promises.writeFile(path.join(siteDir, 'two.yml'), 'name: two\ndescription: two command\nbrowser: false\n');
 
-      await discoverClis(tempRoot);
+      const { writes } = await captureStderr(() => discoverClis(tempRoot));
 
       const warnings = writes.filter((line) => line.includes('YAML adapter'));
       expect(warnings).toHaveLength(1);
       expect(warnings[0]).toContain('Ignoring 2 YAML adapters');
-      expect(warnings[0]).toContain(siteDir);
+      expect(warnings[0]).toContain('site yaml-site');
+      expect(warnings[0]).toContain('one.yaml, two.yml');
       expect(warnings[0]).toContain('cli() API');
     } finally {
-      stderr.mockRestore();
       await fs.promises.rm(tempRoot, { recursive: true, force: true });
     }
   });
@@ -79,25 +87,145 @@ cli({
   it('stays silent for a yaml adapter that already has a .js replacement beside it', async () => {
     const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-migrated-'));
     const siteDir = path.join(tempRoot, 'migrated-site');
-    const writes: string[] = [];
-    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-      writes.push(String(chunk));
-      return true;
-    });
 
     try {
       await fs.promises.mkdir(siteDir, { recursive: true });
-      await fs.promises.writeFile(path.join(siteDir, 'done.yaml'), 'name: done\n');
-      await fs.promises.writeFile(path.join(siteDir, 'done.js'), 'export const migrated = true;\n');
-      await fs.promises.writeFile(path.join(siteDir, 'pending.yml'), 'name: pending\n');
+      await fs.promises.writeFile(path.join(siteDir, 'done.yaml'), 'name: done\ndescription: migrated command\nbrowser: false\n');
+      await fs.promises.writeFile(path.join(siteDir, 'done.js'), `
+import { cli, Strategy } from '${pathToFileURL(path.join(process.cwd(), 'src', 'registry.ts')).href}';
+cli({
+  site: 'migrated-site',
+  name: 'done', access: 'read',
+  description: 'migrated command',
+  strategy: Strategy.PUBLIC,
+  browser: false,
+  func: async () => [{ ok: true }],
+});
+`);
+      await fs.promises.writeFile(path.join(siteDir, 'pending.yml'), 'name: pending\ndescription: pending command\nbrowser: false\n');
 
-      await discoverClis(tempRoot);
+      const { writes } = await captureStderr(() => discoverClis(tempRoot));
 
       const warnings = writes.filter((line) => line.includes('YAML adapter'));
       expect(warnings).toHaveLength(1);
       expect(warnings[0]).toContain('Ignoring 1 YAML adapter ');
+      expect(warnings[0]).toContain('pending.yml');
+      expect(warnings[0]).not.toContain('done.yaml');
     } finally {
-      stderr.mockRestore();
+      await fs.promises.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('warns when the same-basename js replacement is not a CLI module', async () => {
+    const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-bad-js-'));
+    const siteDir = path.join(tempRoot, 'bad-replacement-site');
+
+    try {
+      await fs.promises.mkdir(siteDir, { recursive: true });
+      await fs.promises.writeFile(path.join(siteDir, 'ghost.yaml'), 'name: ghost\ndescription: ghost command\nbrowser: false\n');
+      await fs.promises.writeFile(path.join(siteDir, 'ghost.js'), 'export const helper = true;\n');
+
+      const { writes } = await captureStderr(() => discoverClis(tempRoot));
+
+      const warnings = writes.filter((line) => line.includes('YAML adapter'));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('ghost.yaml');
+    } finally {
+      await fs.promises.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('warns during valid-manifest fast path when yaml adapters are skipped', async () => {
+    const tempBuildRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-manifest-'));
+    const distDir = path.join(tempBuildRoot, 'dist');
+    const siteDir = path.join(distDir, 'manifest-site');
+    const manifestPath = path.join(tempBuildRoot, 'cli-manifest.json');
+
+    try {
+      await fs.promises.mkdir(siteDir, { recursive: true });
+      await fs.promises.writeFile(manifestPath, '[]\n');
+      await fs.promises.writeFile(path.join(siteDir, 'lost.yaml'), 'name: lost\ndescription: lost command\nbrowser: false\n');
+
+      const { writes } = await captureStderr(() => discoverClis(distDir));
+
+      const warnings = writes.filter((line) => line.includes('YAML adapter'));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('site manifest-site');
+      expect(warnings[0]).toContain('lost.yaml');
+    } finally {
+      await fs.promises.rm(tempBuildRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('trusts a same-basename js replacement only when it is present in the valid manifest', async () => {
+    const tempBuildRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-manifest-replacement-'));
+    const distDir = path.join(tempBuildRoot, 'dist');
+    const siteDir = path.join(distDir, 'manifest-replacement-site');
+    const manifestPath = path.join(tempBuildRoot, 'cli-manifest.json');
+
+    try {
+      await fs.promises.mkdir(siteDir, { recursive: true });
+      await fs.promises.writeFile(path.join(siteDir, 'done.yaml'), 'name: done\ndescription: done command\nbrowser: false\n');
+      await fs.promises.writeFile(path.join(siteDir, 'done.js'), 'export const helper = true;\n');
+      await fs.promises.writeFile(path.join(siteDir, 'ghost.yaml'), 'name: ghost\ndescription: ghost command\nbrowser: false\n');
+      await fs.promises.writeFile(path.join(siteDir, 'ghost.js'), 'export const helper = true;\n');
+      await fs.promises.writeFile(manifestPath, `${JSON.stringify([{
+        site: 'manifest-replacement-site',
+        name: 'done',
+        access: 'read',
+        browser: false,
+        modulePath: 'manifest-replacement-site/done.js',
+        sourceFile: 'manifest-replacement-site/done.js',
+      }])}\n`);
+
+      const { writes } = await captureStderr(() => discoverClis(distDir));
+
+      const warnings = writes.filter((line) => line.includes('YAML adapter'));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('ghost.yaml');
+      expect(warnings[0]).not.toContain('done.yaml');
+    } finally {
+      await fs.promises.rm(tempBuildRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not repeat the same yaml warning across repeated discovery calls', async () => {
+    const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-repeat-'));
+    const siteDir = path.join(tempRoot, 'repeat-site');
+
+    try {
+      await fs.promises.mkdir(siteDir, { recursive: true });
+      await fs.promises.writeFile(path.join(siteDir, 'once.yaml'), 'name: once\ndescription: once command\nbrowser: false\n');
+
+      const { writes } = await captureStderr(async () => {
+        await discoverClis(tempRoot);
+        await discoverClis(tempRoot);
+      });
+
+      expect(writes.filter((line) => line.includes('YAML adapter'))).toHaveLength(1);
+    } finally {
+      await fs.promises.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('still warns for a newly added skipped yaml adapter after an earlier discovery call', async () => {
+    const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-repeat-new-'));
+    const siteDir = path.join(tempRoot, 'repeat-new-site');
+
+    try {
+      await fs.promises.mkdir(siteDir, { recursive: true });
+      await fs.promises.writeFile(path.join(siteDir, 'first.yaml'), 'name: first\ndescription: first command\nbrowser: false\n');
+
+      const first = await captureStderr(() => discoverClis(tempRoot));
+      await fs.promises.writeFile(path.join(siteDir, 'second.yml'), 'name: second\ndescription: second command\nbrowser: false\n');
+      const second = await captureStderr(() => discoverClis(tempRoot));
+
+      expect(first.writes.filter((line) => line.includes('YAML adapter'))).toHaveLength(1);
+      const secondWarnings = second.writes.filter((line) => line.includes('YAML adapter'));
+      expect(secondWarnings).toHaveLength(1);
+      expect(secondWarnings[0]).toContain('second.yml');
+      expect(secondWarnings[0]).not.toContain('first.yaml');
+    } finally {
       await fs.promises.rm(tempRoot, { recursive: true, force: true });
     }
   });
@@ -105,21 +233,15 @@ cli({
   it('stays silent for a site directory with no yaml adapters', async () => {
     const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-yaml-none-'));
     const siteDir = path.join(tempRoot, 'js-only-site');
-    const writes: string[] = [];
-    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-      writes.push(String(chunk));
-      return true;
-    });
 
     try {
       await fs.promises.mkdir(siteDir, { recursive: true });
       await fs.promises.writeFile(path.join(siteDir, 'notes.md'), '# notes\n');
 
-      await discoverClis(tempRoot);
+      const { writes } = await captureStderr(() => discoverClis(tempRoot));
 
       expect(writes.filter((line) => line.includes('YAML adapter'))).toEqual([]);
     } finally {
-      stderr.mockRestore();
       await fs.promises.rm(tempRoot, { recursive: true, force: true });
     }
   });
@@ -241,23 +363,25 @@ description: Test plugin greeting
 strategy: public
 browser: false
 `);
-    const writes: string[] = [];
-    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
-      writes.push(String(chunk));
-      return true;
-    });
+    await fs.promises.writeFile(path.join(testPluginDir, 'config.yaml'), `
+name: config
+version: 1
+`);
+    await fs.promises.writeFile(path.join(testPluginDir, 'data.yml'), `
+- just
+- data
+`);
 
-    try {
-      await discoverPlugins();
-    } finally {
-      stderr.mockRestore();
-    }
+    const { writes } = await captureStderr(() => discoverPlugins());
 
     const registry = getRegistry();
     const cmd = registry.get('__test-plugin__/greeting');
     expect(cmd).toBeUndefined();
-    const warnings = writes.filter((line) => line.includes('YAML adapter') && line.includes(testPluginDir));
+    const warnings = writes.filter((line) => line.includes('YAML adapter') && line.includes('plugin __test-plugin__'));
     expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('greeting.yaml');
+    expect(warnings[0]).not.toContain('config.yaml');
+    expect(warnings[0]).not.toContain('data.yml');
   });
 
   it('handles non-existent plugins directory gracefully', async () => {

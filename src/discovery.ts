@@ -12,6 +12,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import yaml from 'js-yaml';
 import { type InternalCliCommand, Strategy, registerCommand } from './registry.js';
 import { getErrorMessage } from './errors.js';
 import { log } from './logger.js';
@@ -26,6 +27,8 @@ export const USER_CLIS_DIR = path.join(USER_OPENCLI_DIR, 'clis');
 export const PLUGINS_DIR = path.join(USER_OPENCLI_DIR, 'plugins');
 /** Matches files that register commands via cli() or lifecycle hooks */
 const PLUGIN_MODULE_PATTERN = /\b(?:cli|registerSiteAuthCommands|onStartup|onBeforeExecute|onAfterExecute)\s*\(/;
+const YAML_ADAPTER_EXT_RE = /\.ya?ml$/i;
+const warnedYamlAdapterPaths = new Set<string>();
 
 function parseStrategy(rawStrategy: string | undefined, fallback: Strategy = Strategy.COOKIE): Strategy {
   if (!rawStrategy) return fallback;
@@ -99,7 +102,10 @@ export async function discoverClis(...dirs: string[]): Promise<void> {
     try {
       await fs.promises.access(manifestPath);
       const loaded = await loadFromManifest(manifestPath, dir);
-      if (loaded) continue; // Skip filesystem scan only when manifest is usable
+      if (loaded) {
+        await warnIgnoredYamlAdaptersInCliRoot(dir, loaded.manifestFiles);
+        continue; // Skip filesystem scan only when manifest is usable
+      }
     } catch {
       // Fall through to filesystem scan
     }
@@ -111,13 +117,16 @@ export async function discoverClis(...dirs: string[]): Promise<void> {
  * Fast-path: register commands from pre-compiled manifest.
  * TS modules are deferred — loaded lazily on first execution.
  */
-async function loadFromManifest(manifestPath: string, clisDir: string): Promise<boolean> {
+async function loadFromManifest(manifestPath: string, clisDir: string): Promise<{ manifestFiles: Set<string> } | null> {
   try {
     const raw = await fs.promises.readFile(manifestPath, 'utf-8');
     const manifest = JSON.parse(raw) as ManifestEntry[];
+    const manifestFiles = new Set<string>();
     for (const entry of manifest) {
       if (!entry.modulePath) continue;
       const modulePath = path.resolve(clisDir, entry.modulePath);
+      manifestFiles.add(modulePath);
+      if (entry.sourceFile) manifestFiles.add(path.resolve(clisDir, entry.sourceFile));
       const cmd: InternalCliCommand = {
         site: entry.site,
         name: entry.name,
@@ -142,10 +151,10 @@ async function loadFromManifest(manifestPath: string, clisDir: string): Promise<
       // normalizeCommand inside registerCommand handles strategy → browser/navigateBefore
       registerCommand(cmd);
     }
-    return true;
+    return { manifestFiles };
   } catch (err) {
     log.warn(`Failed to load manifest ${manifestPath}: ${getErrorMessage(err)}`);
-    return false;
+    return null;
   }
 }
 
@@ -155,6 +164,7 @@ async function loadFromManifest(manifestPath: string, clisDir: string): Promise<
 async function discoverClisFromFs(dir: string): Promise<void> {
   try { await fs.promises.access(dir); } catch { return; }
   const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  await warnIgnoredYamlAdaptersInCliRoot(dir);
   
   const sitePromises = entries
     .filter(entry => entry.isDirectory())
@@ -162,10 +172,9 @@ async function discoverClisFromFs(dir: string): Promise<void> {
       const site = entry.name;
       const siteDir = path.join(dir, site);
       const files = await fs.promises.readdir(siteDir);
-      warnIgnoredYamlAdapters(siteDir, new Set(files));
       await Promise.all(files.map(async (file) => {
         const filePath = path.join(siteDir, file);
-        if (file.endsWith('.yaml') || file.endsWith('.yml')) {
+        if (isYamlAdapterFile(file)) {
           return;
         }
         if (file.endsWith('.ts') && !file.endsWith('.d.ts') && !file.endsWith('.test.ts')) {
@@ -190,10 +199,19 @@ async function discoverClisFromFs(dir: string): Promise<void> {
  */
 export async function discoverPlugins(): Promise<void> {
   try { await fs.promises.access(PLUGINS_DIR); } catch { return; }
-  const entries = await fs.promises.readdir(PLUGINS_DIR, { withFileTypes: true });
-  await Promise.all(entries.map(async (entry) => {
+  const entries = (await fs.promises.readdir(PLUGINS_DIR, { withFileTypes: true }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const discoverable: Array<{ entry: fs.Dirent; pluginDir: string }> = [];
+  for (const entry of entries) {
     const pluginDir = path.join(PLUGINS_DIR, entry.name);
-    if (!(await isDiscoverablePluginDir(entry, pluginDir))) return;
+    if (await isDiscoverablePluginDir(entry, pluginDir)) {
+      discoverable.push({ entry, pluginDir });
+    }
+  }
+  for (const { entry, pluginDir } of discoverable) {
+    await warnIgnoredYamlAdaptersInFlatDir(pluginDir, { owner: `plugin ${entry.name}`, pluginMode: true });
+  }
+  await Promise.all(discoverable.map(async ({ entry, pluginDir }) => {
     await discoverPluginDir(pluginDir, entry.name);
   }));
 }
@@ -205,10 +223,9 @@ export async function discoverPlugins(): Promise<void> {
 async function discoverPluginDir(dir: string, site: string): Promise<void> {
   const files = await fs.promises.readdir(dir);
   const fileSet = new Set(files);
-  warnIgnoredYamlAdapters(dir, fileSet);
   await Promise.all(files.map(async (file) => {
     const filePath = path.join(dir, file);
-    if (file.endsWith('.yaml') || file.endsWith('.yml')) {
+    if (isYamlAdapterFile(file)) {
       return;
     }
     if (file.endsWith('.js') && !file.endsWith('.d.js')) {
@@ -232,15 +249,102 @@ async function discoverPluginDir(dir: string, site: string): Promise<void> {
   }));
 }
 
-/**
- * Warn once per directory for `.yaml` adapters that are skipped without a `.js`
- * replacement beside them, so a directory of them cannot vanish silently.
- */
-function warnIgnoredYamlAdapters(dir: string, files: Set<string>): void {
-  const ignored = [...files].filter((file) => (file.endsWith('.yaml') || file.endsWith('.yml'))
-    && !files.has(file.replace(/\.ya?ml$/, '.js')));
+async function warnIgnoredYamlAdaptersInCliRoot(dir: string, manifestFiles?: Set<string>): Promise<void> {
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries.filter((candidate) => candidate.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
+    const siteDir = path.join(dir, entry.name);
+    await warnIgnoredYamlAdaptersInFlatDir(siteDir, { owner: `site ${entry.name}`, manifestFiles });
+  }
+}
+
+async function warnIgnoredYamlAdaptersInFlatDir(
+  dir: string,
+  options: { owner: string; manifestFiles?: Set<string>; pluginMode?: boolean },
+): Promise<void> {
+  let files: string[];
+  try {
+    files = await fs.promises.readdir(dir);
+  } catch (err) {
+    log.warn(`Could not inspect YAML adapters for ${options.owner}: ${getErrorMessage(err)}`);
+    return;
+  }
+
+  const fileSet = new Set(files);
+  const ignored: string[] = [];
+  for (const file of files.filter(isYamlAdapterFile).sort()) {
+    const filePath = path.join(dir, file);
+    if (!(await isLikelyYamlAdapter(filePath, options.pluginMode === true))) continue;
+    if (await hasUsableJsReplacement(dir, file, fileSet, options.manifestFiles)) continue;
+    const warningKey = await stableWarningKey(filePath);
+    if (warnedYamlAdapterPaths.has(warningKey)) continue;
+    warnedYamlAdapterPaths.add(warningKey);
+    ignored.push(file);
+  }
+
   if (ignored.length === 0) return;
-  log.warn(`Ignoring ${ignored.length} YAML adapter${ignored.length === 1 ? '' : 's'} in ${dir} — .yaml adapters are no longer loaded. Convert them to .js with the cli() API.`);
+  log.warn(
+    `Ignoring ${ignored.length} YAML adapter${ignored.length === 1 ? '' : 's'} for ${options.owner}: `
+    + `${ignored.join(', ')}. .yaml/.yml adapters are no longer loaded; convert them to .js with the cli() API.`,
+  );
+}
+
+function isYamlAdapterFile(file: string): boolean {
+  return YAML_ADAPTER_EXT_RE.test(file);
+}
+
+async function hasUsableJsReplacement(
+  dir: string,
+  yamlFile: string,
+  fileSet: Set<string>,
+  manifestFiles?: Set<string>,
+): Promise<boolean> {
+  const jsFile = yamlFile.replace(YAML_ADAPTER_EXT_RE, '.js');
+  if (!fileSet.has(jsFile)) return false;
+
+  const jsPath = path.resolve(dir, jsFile);
+  if (manifestFiles) return manifestFiles.has(jsPath);
+  return isCliModule(jsPath);
+}
+
+async function isLikelyYamlAdapter(filePath: string, pluginMode: boolean): Promise<boolean> {
+  let source: string;
+  try {
+    source = await fs.promises.readFile(filePath, 'utf-8');
+  } catch {
+    return !pluginMode;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = yaml.load(source);
+  } catch {
+    return !pluginMode;
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.name !== 'string' || !record.name.trim()) return false;
+
+  const adapterKeys = [
+    'site', 'description', 'access', 'strategy', 'browser', 'domain',
+    'args', 'columns', 'pipeline', 'url', 'request', 'steps', 'extract',
+    'output', 'func', 'method', 'headers',
+  ];
+  return adapterKeys.some((key) => key in record);
+}
+
+async function stableWarningKey(filePath: string): Promise<string> {
+  try {
+    return await fs.promises.realpath(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
 }
 
 async function isCliModule(filePath: string): Promise<boolean> {
