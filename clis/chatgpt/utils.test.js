@@ -79,6 +79,17 @@ describe('chatgpt image wait contract', () => {
         await expect(waitForChatGPTImages(page, [], 9, convUrl)).rejects.toThrow(/chatgpt image timed out/);
     });
 
+    it('rejects data URL completion candidates case-insensitively', async () => {
+        const convUrl = 'https://chatgpt.com/c/demo';
+        const page = createPageMock({
+            location: convUrl,
+            generating: [false],
+            imageUrls: [['DATA:image/png;base64,halfdrawnframe']],
+        });
+
+        await expect(waitForChatGPTImages(page, [], 9, convUrl)).rejects.toThrow(/chatgpt image timed out/);
+    });
+
     it('keeps only backend-served URLs when a canvas frame renders alongside them', async () => {
         const convUrl = 'https://chatgpt.com/c/demo';
         const page = createPageMock({

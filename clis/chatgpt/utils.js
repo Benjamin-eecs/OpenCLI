@@ -2685,7 +2685,7 @@ export async function waitForChatGPTImages(page, beforeUrls, timeoutSeconds, con
         // would pass the stability gate below as a finished image (#1898).
         // Kept out of completion, they still mark the wait as rendering so a
         // deadline reports TIMEOUT instead of EMPTY_RESULT.
-        const urls = candidates.filter(url => !url.startsWith('data:'));
+        const urls = candidates.filter(url => !/^data:/i.test(url));
         stillRendering = urls.length === 0 && candidates.length > 0;
         if (urls.length === 0) continue;
 
