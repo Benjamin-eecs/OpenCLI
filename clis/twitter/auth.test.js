@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AuthRequiredError } from '@jackwener/opencli/errors';
+import { AuthRequiredError, CommandExecutionError } from '@jackwener/opencli/errors';
 import { getRegistry } from '@jackwener/opencli/registry';
 import './auth.js';
 
@@ -34,7 +34,7 @@ function whoamiCommand() {
 
 describe('twitter whoami command', () => {
     it('waits out a page that still shows the previous account', async () => {
-        const page = createPageMock(['/old_acct', '/old_acct', '/new_acct', '/new_acct', '/new_acct']);
+        const page = createPageMock(['/old_acct', '/old_acct', '/old_acct', '/old_acct', '/new_acct', '/new_acct', '/new_acct', '/new_acct']);
 
         await expect(whoamiCommand().func(page)).resolves.toMatchObject({
             logged_in: true,
@@ -43,17 +43,30 @@ describe('twitter whoami command', () => {
         });
     });
 
-    it('returns once the handle holds across three reads', async () => {
+    it('waits the full settle window before trusting a steady handle', async () => {
         const page = createPageMock(['/steady_acct']);
 
         await expect(whoamiCommand().func(page)).resolves.toMatchObject({ username: 'steady_acct' });
-        expect(page.evaluate).toHaveBeenCalledTimes(3);
+        expect(page.evaluate).toHaveBeenCalledTimes(8);
+        expect(page.sleep).toHaveBeenCalledTimes(7);
     });
 
     it('accepts a link that only appears after several polls', async () => {
-        const page = createPageMock([null, null, null, '/late_acct', '/late_acct', '/late_acct']);
+        const page = createPageMock([null, null, '/late_acct', '/late_acct', '/late_acct', '/late_acct', '/late_acct', '/late_acct']);
 
         await expect(whoamiCommand().func(page)).resolves.toMatchObject({ username: 'late_acct' });
+    });
+
+    it('accepts a new account after an old value clears during the settle window', async () => {
+        const page = createPageMock(['/old_acct', '/old_acct', null, '/new_acct', '/new_acct', '/new_acct', '/new_acct', '/new_acct']);
+
+        await expect(whoamiCommand().func(page)).resolves.toMatchObject({ username: 'new_acct' });
+    });
+
+    it('does not trust a transient new account that reverts before the window ends', async () => {
+        const page = createPageMock(['/old_acct', '/new_acct', '/new_acct', '/old_acct', '/old_acct', '/old_acct', '/old_acct', '/old_acct']);
+
+        await expect(whoamiCommand().func(page)).resolves.toMatchObject({ username: 'old_acct' });
     });
 
     it('typed-fails instead of returning an unconfirmed account', async () => {
@@ -66,6 +79,19 @@ describe('twitter whoami command', () => {
 
     it('typed-fails when the profile link never appears', async () => {
         const page = createPageMock([null]);
+
+        await expect(whoamiCommand().func(page)).rejects.toBeInstanceOf(AuthRequiredError);
+    });
+
+    it('typed-fails malformed Browser Bridge profile-link envelopes', async () => {
+        const page = createPageMock([]);
+        page.evaluate.mockResolvedValue({ session: { id: 'site:twitter' }, data: '/current_acct' });
+
+        await expect(whoamiCommand().func(page)).rejects.toBeInstanceOf(CommandExecutionError);
+    });
+
+    it('does not accept non-profile paths as identity evidence', async () => {
+        const page = createPageMock(['/home', '/i/bookmarks', '/current_acct/status/123', 'https://evil.example/current_acct']);
 
         await expect(whoamiCommand().func(page)).rejects.toBeInstanceOf(AuthRequiredError);
     });
