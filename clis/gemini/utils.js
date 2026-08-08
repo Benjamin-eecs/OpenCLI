@@ -2362,14 +2362,27 @@ export async function getGeminiVisibleImageUrls(page) {
       return urls;
     })()
   `);
-    return requireGeminiArrayResult(result, 'Gemini image detection');
+    const urls = requireGeminiArrayResult(result, 'Gemini image detection');
+    if (!urls.every((url) => typeof url === 'string')) {
+        throw new CommandExecutionError('Gemini image detection returned a malformed result');
+    }
+    return urls;
 }
 /** Cheap generation probe: the snapshot read walks the whole transcript. */
 export async function isGeminiGenerating(page) {
-    const value = await page.evaluate(`(() => ${isGeneratingExpression()})()`)
-        .then((result) => unwrapGeminiEvaluateResult(result, 'Gemini generation probe'))
-        .catch(() => null);
-    return typeof value === 'boolean' ? value : null;
+    let result;
+    try {
+        result = await page.evaluate(`(() => ${isGeneratingExpression()})()`);
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new CommandExecutionError('Gemini generation probe failed', message);
+    }
+    const value = unwrapGeminiEvaluateResult(result, 'Gemini generation probe');
+    if (typeof value !== 'boolean') {
+        throw new CommandExecutionError('Gemini generation probe returned a malformed result');
+    }
+    return value;
 }
 export async function waitForGeminiImages(page, beforeUrls, timeoutSeconds) {
     const beforeSet = new Set(beforeUrls);
@@ -2485,7 +2498,18 @@ export async function exportGeminiImages(page, urls) {
       return results;
     })(${urlsJson})
   `);
-    return requireGeminiArrayResult(result, 'Gemini image export');
+    const assets = requireGeminiArrayResult(result, 'Gemini image export');
+    for (const asset of assets) {
+        if (!isObjectRecord(asset)
+            || typeof asset.url !== 'string'
+            || typeof asset.dataUrl !== 'string'
+            || !/^data:[^;,]+;base64,[A-Za-z0-9+/]+=*$/.test(asset.dataUrl)
+            || typeof asset.mimeType !== 'string'
+            || !asset.mimeType.startsWith('image/')) {
+            throw new CommandExecutionError('Gemini image export returned a malformed result');
+        }
+    }
+    return assets;
 }
 export async function waitForGeminiResponse(page, baseline, promptText, timeoutSeconds) {
     if (timeoutSeconds <= 0)

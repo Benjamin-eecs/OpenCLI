@@ -110,10 +110,17 @@ describe('gemini image wait contract', () => {
         await expect(waitForGeminiImages(page, [], 9)).rejects.toThrow(/gemini image timed out/);
     });
 
-    it('keeps the last known generation state when the probe stops answering', async () => {
+    it('fails closed when the generation probe stops answering', async () => {
         const page = createPageMock({ generating: [true, 'unreadable'] });
 
-        await expect(waitForGeminiImages(page, [], 9)).rejects.toThrow(/gemini image timed out/);
+        await expect(waitForGeminiImages(page, [], 9)).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
+    });
+
+    it('does not accept a visible image when the first generation probe fails', async () => {
+        const page = createPageMock({ generating: ['unreadable'] });
+        mountImage(page.dom, { src: 'https://lh3.googleusercontent.com/unknown-state.png', naturalWidth: 1024, complete: true });
+
+        await expect(waitForGeminiImages(page, [], 9)).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
     });
 
     it('drops candidate images if the generation probe resumes as still generating', async () => {
@@ -165,6 +172,23 @@ describe('gemini image export', () => {
         await expect(exportGeminiImages(page, ['blob:https://gemini.google.com/ok'])).resolves.toEqual([
             expect.objectContaining({ dataUrl: PNG_DATA_URL, mimeType: 'image/png' }),
         ]);
+    });
+
+    it('fails closed when Browser Bridge returns malformed exported assets', async () => {
+        const page = {
+            goto: vi.fn().mockResolvedValue(undefined),
+            wait: vi.fn().mockResolvedValue(undefined),
+            evaluate: vi.fn((script) => {
+                if (script === 'window.location.href')
+                    return Promise.resolve(CONVERSATION_URL);
+                return Promise.resolve({
+                    session: 'site:gemini',
+                    data: [{ dataUrl: PNG_DATA_URL, mimeType: 'image/png' }],
+                });
+            }),
+        };
+
+        await expect(exportGeminiImages(page, ['blob:https://gemini.google.com/bad'])).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
     });
 
     it('drops a response that came back as a page instead of an image', async () => {
