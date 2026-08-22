@@ -1,4 +1,4 @@
-import { CommandExecutionError } from '@jackwener/opencli/errors';
+import { CommandExecutionError, TimeoutError } from '@jackwener/opencli/errors';
 import { cli, Strategy } from '@jackwener/opencli/registry';
 import { parseTweetUrl, buildTwitterArticleScopeSource } from './shared.js';
 
@@ -21,6 +21,7 @@ cli({
         await page.goto(target.url);
         await page.wait({ selector: '[data-testid="primaryColumn"]' });
         const result = await page.evaluate(`(async () => {
+        let writeStarted = false;
         try {
             ${buildTwitterArticleScopeSource(target.id)}
             // Poll for the tweet to render. State probes scoped to the article
@@ -53,6 +54,7 @@ cli({
             }
 
             // Click Unlike
+            writeStarted = true;
             unlikeBtn.click();
             await new Promise(r => setTimeout(r, 1000));
 
@@ -62,12 +64,15 @@ cli({
             if (verifyBtn) {
                 return { ok: true, message: 'Tweet successfully unliked.' };
             } else {
-                return { ok: false, message: 'Unlike action was initiated but UI did not update as expected.' };
+                return { ok: false, unconfirmed: true, message: 'Unlike action was initiated but UI did not update as expected.' };
             }
         } catch (e) {
-            return { ok: false, message: e.toString() };
+            return { ok: false, unconfirmed: writeStarted, message: e.toString() };
         }
     })()`);
+        if (result.unconfirmed) {
+            throw new TimeoutError('twitter unlike confirmation', 1, `${result.message} Check the tweet before retrying; the unlike may already have succeeded.`);
+        }
         if (!result.ok) {
             throw new CommandExecutionError(result.message, 'Nothing changed. Open the tweet in the browser and retry.');
         }

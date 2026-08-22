@@ -3,6 +3,7 @@ import { CommandExecutionError } from '@jackwener/opencli/errors';
 import { getRegistry } from '@jackwener/opencli/registry';
 import './block.js';
 import { createPageMock } from '../test-utils.js';
+import { createTwitterDomPage } from './test-dom-utils.js';
 
 describe('twitter block command', () => {
     it('navigates to the profile URL and reports success when the block script confirms', async () => {
@@ -47,6 +48,37 @@ describe('twitter block command', () => {
             message: 'Could not find user actions menu. Are you logged in?',
         });
         expect(page.wait).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps a missing confirmation dialog a definite pre-write failure', async () => {
+        const cmd = getRegistry().get('twitter/block');
+        const page = createTwitterDomPage(`
+            <button data-testid="userActions">More</button>
+            <button role="menuitem">Block @alice</button>
+        `, 'https://x.com/alice');
+
+        await expect(cmd.func(page, { username: 'alice' })).rejects.toMatchObject({
+            name: 'CommandExecutionError',
+            code: 'COMMAND_EXEC',
+            exitCode: 1,
+            message: 'Block confirmation dialog did not appear.',
+        });
+    });
+
+    it('treats a missing post-confirm profile state change as unconfirmed', async () => {
+        const cmd = getRegistry().get('twitter/block');
+        const page = createTwitterDomPage(`
+            <button data-testid="userActions">More</button>
+            <button role="menuitem">Block @alice</button>
+            <button data-testid="confirmationSheetConfirm">Confirm</button>
+        `, 'https://x.com/alice');
+
+        await expect(cmd.func(page, { username: 'alice' })).rejects.toMatchObject({
+            name: 'TimeoutError',
+            code: 'TIMEOUT',
+            exitCode: 75,
+            hint: expect.stringContaining('may already have succeeded'),
+        });
     });
 
     it('throws CommandExecutionError when no page is provided', async () => {

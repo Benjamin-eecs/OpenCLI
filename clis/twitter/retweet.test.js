@@ -3,6 +3,7 @@ import { ArgumentError, CommandExecutionError } from '@jackwener/opencli/errors'
 import { getRegistry } from '@jackwener/opencli/registry';
 import './retweet.js';
 import { createPageMock } from '../test-utils.js';
+import { createTwitterDomPage } from './test-dom-utils.js';
 
 describe('twitter retweet command', () => {
     it('clicks the retweet button then the confirm menu item and reports success', async () => {
@@ -52,6 +53,27 @@ describe('twitter retweet command', () => {
             code: 'COMMAND_EXEC',
             exitCode: 1,
             message: 'Retweet menu opened but the confirm option did not appear.',
+        });
+        expect(page.wait).toHaveBeenCalledTimes(1);
+    });
+
+    it('treats a missing post-confirm state change as unconfirmed', async () => {
+        const cmd = getRegistry().get('twitter/retweet');
+        const page = createTwitterDomPage(`
+            <article>
+              <a href="https://x.com/alice/status/2040254679301718161">tweet</a>
+              <button data-testid="retweet">Retweet</button>
+            </article>
+            <button data-testid="retweetConfirm">Confirm retweet</button>
+        `);
+
+        await expect(cmd.func(page, {
+            url: 'https://x.com/alice/status/2040254679301718161',
+        })).rejects.toMatchObject({
+            name: 'TimeoutError',
+            code: 'TIMEOUT',
+            exitCode: 75,
+            hint: expect.stringContaining('may already have succeeded'),
         });
         expect(page.wait).toHaveBeenCalledTimes(1);
     });
